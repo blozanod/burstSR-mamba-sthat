@@ -48,8 +48,13 @@ class MambaFusionModel(SRModel):
             l_total = 0
             loss_dict = OrderedDict()
 
-            # Projection into SRGB via Signed Mu-Law
-            cp, cg = self.compand(self.output), self.compand(self.gt)
+            # Projection into SRGB via Signed Mu-Law. Config-gated: compand
+            # defaults to true (RealBSR behavior); PLAN.md L3 sets it to false
+            # to train on plain linear RGB.
+            if self.opt['train'].get('compand', True):
+                cp, cg = self.compand(self.output), self.compand(self.gt)
+            else:
+                cp, cg = self.output, self.gt
 
             # pixel loss
             if self.cri_pix:

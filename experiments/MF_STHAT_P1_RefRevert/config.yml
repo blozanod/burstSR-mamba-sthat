@@ -1,0 +1,120 @@
+# config.yml
+name: MF_STHAT_P1_RefRevert
+model_type: MambaFusionModel
+scale: 8
+num_gpu: 4
+manual_seed: 42
+find_unused_parameters: false
+
+# Dataset
+datasets:
+  train:
+    name: RealBSR_train
+    type: BurstImageDataset
+    dataroot: /groups/rls/blozanod/MambaFusion/dataset/RealBSR_RAW_trainpatch
+    num_frames: 5
+    phase: train
+    scale: 8
+    batch_size_per_gpu: 4
+    num_worker_per_gpu: 6
+    dataset_enlarge_ratio: 1
+    grad_clip_norm: 1
+
+  val:
+    name: RealBSR_val
+    type: BurstImageDataset
+    dataroot: /groups/rls/blozanod/MambaFusion/dataset/RealBSR_RAW_testpatch
+    num_frames: 5
+    phase: val
+    scale: 8
+
+# Network
+network_g:
+  type: MambaFusionNet
+  # General Config
+  global_skip: false
+  num_frames: 5
+  img_size: 80
+  num_feat: 64
+  # Alignment Specific Config
+  offset_groups: 4
+  # Fusion Specific Config
+  fusion_ws: 8
+  fusion_feat: 96
+  fusion_mlp_ratio: 4
+  fusion_heads: 4
+  fusion_overlap: 0.25
+  fusion_depth_s1: 3
+  fusion_depth_s3: 3
+  # MambaIRv2 Specific Config
+  embed_dim: 48
+  d_state: 8
+  scale: 8
+  depths: [5, 5, 5, 5]
+  num_heads: [4, 4, 4, 4]
+  window_size: 16
+  inner_rank: 32
+  num_tokens: 64
+  convffn_kernel_size: 5
+  mlp_ratio: 2
+  upsampler: 'pixelshuffle'
+  resi_connection: '1conv'
+  is_train: true
+
+# Training
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+  experiments_root: ~
+
+train:
+  accumulation_steps: 2
+  total_iter: 35000
+  warmup_iter: 10000
+
+  optim_g:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+
+  scheduler:
+    type: MultiStepLR
+    milestones: [35000, 65000, 85000]
+
+  pixel_opt:
+    type: CharbonnierLoss
+    loss_weight: 1.0
+    reduction: mean
+  edge_opt:
+    type: SobelLoss
+    loss_weight: 0.5
+
+# Validation
+val:
+  val_freq: 5000
+  save_img: false
+  metrics:
+    psnr_srgb:
+      type: calculate_psnr_srgb
+      crop_border: 40
+      test_y_channel: false
+      better: higher
+    psnr_linear:
+      type: calculate_psnr_linear
+      crop_border: 40
+      test_y_channel: false
+      better: higher
+    ssim:
+      type: calculate_ssim_srgb
+      crop_border: 40
+      test_y_channel: false
+      better: higher
+
+# Logging
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 5000
+  use_tb_logger: false

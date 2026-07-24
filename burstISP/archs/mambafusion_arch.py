@@ -106,7 +106,7 @@ class MambaFusionNet(nn.Module):
         fused_input = self.fusion(aligned_burst)
 
         # Restore high-quality image from fused features
-        deep_residual = self.restoration(fused_input, fused_input)  # Shape: [B, C_out, H_out, W_out]
+        deep_residual = self.restoration(fused_input, ref_feats)  # Shape: [B, C_out, H_out, W_out]
 
         # Add long skip connection
         if self.is_global_skip:

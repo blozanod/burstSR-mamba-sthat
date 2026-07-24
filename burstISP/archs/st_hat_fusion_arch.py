@@ -671,7 +671,7 @@ class FusionBlock(nn.Module):
         attn_win = self.proj(x_attn)
 
         # residual
-        x_res1 = attn_win + x_win.mean(dim=1)
+        x_res1 = attn_win + x_win[:, ref]
 
         # mlp
         x_norm2 = self.norm2(x_res1)
@@ -861,7 +861,7 @@ class ST_HAT(nn.Module):
         x_s2b1 = self.fusion_block(x_s1, self.rpi_sa_3d)
         x_s2b2 = self.s2_spatial(x_s2b1.unsqueeze(1), self.rpi_sa).squeeze(1)
 
-        x_s1b3_ref = x_s1.mean(dim=1)
+        x_s1b3_ref = x_s1[:, ref]
         x_s1b3_proj = self.proj(x_s1b3_ref)
         x_s2b2 = x_s2b2 + x_s1b3_proj
 

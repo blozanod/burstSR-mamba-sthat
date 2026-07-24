@@ -228,10 +228,14 @@ class SRModel(BaseModel):
             self.feed_data(val_data)
             self.test()
 
-            # Adds meta_data to metric_data for validation
-            pkl_path = val_data['meta'][0]
-            with open(pkl_path, 'rb') as f:
-                meta_data = pkl.load(f)
+            # Adds meta_data to metric_data for validation. The 'meta' key is
+            # optional: synthetic datasets carry no camera pkl, and metrics
+            # that need one are simply not configured for them.
+            meta_data = None
+            if 'meta' in val_data:
+                pkl_path = val_data['meta'][0]
+                with open(pkl_path, 'rb') as f:
+                    meta_data = pkl.load(f)
             metric_data['meta_data'] = meta_data
 
             # Set img metric_data
@@ -250,10 +254,16 @@ class SRModel(BaseModel):
             torch.cuda.empty_cache()
 
             if save_img:
-                # Apply ISP
-                sr_img_srgb = generate_processed_image_channel3(
-                    sr_tensor.cpu(), meta_data, return_np=True, black_level_substracted=True)
-                sr_img_srgb = cv2.cvtColor(sr_img_srgb, cv2.COLOR_RGB2BGR)
+                if meta_data is not None:
+                    # Apply ISP
+                    sr_img_srgb = generate_processed_image_channel3(
+                        sr_tensor.cpu(), meta_data, return_np=True, black_level_substracted=True)
+                    sr_img_srgb = cv2.cvtColor(sr_img_srgb, cv2.COLOR_RGB2BGR)
+                else:
+                    # No camera metadata (synthetic data): save a plain
+                    # gamma-encoded preview of the linear output instead.
+                    sr_img = sr_tensor.cpu().clamp(0, 1).pow(1 / 2.2).mul(255.0).round().byte()
+                    sr_img_srgb = cv2.cvtColor(sr_img.permute(1, 2, 0).numpy(), cv2.COLOR_RGB2BGR)
 
                 if self.opt['is_train']:
                     save_img_path = osp.join(self.opt['path']['visualization'], img_name,

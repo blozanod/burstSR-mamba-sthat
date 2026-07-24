@@ -2,8 +2,12 @@ from copy import deepcopy
 
 from burstISP.utils.registry import METRIC_REGISTRY
 from .psnr_ssim import calculate_psnr, calculate_ssim, calculate_psnr_linear, calculate_psnr_srgb, calculate_ssim_srgb
+from .synburst_psnr import calculate_psnr_synburst
 
-__all__ = ['calculate_psnr', 'calculate_ssim', 'calculate_psnr_srgb', 'calculate_psnr_linear', 'calculate_ssim_srgb']
+__all__ = [
+    'calculate_psnr', 'calculate_ssim', 'calculate_psnr_srgb', 'calculate_psnr_linear', 'calculate_ssim_srgb',
+    'calculate_psnr_synburst'
+]
 
 
 def calculate_metric(data, opt):

@@ -6,7 +6,10 @@ Each subfolder here is one training run: its config, checkpoints (`models/` or l
 
 - **STHAT_Fixed35k** — first stable run of the ST-HAT + MambaIRv2 architecture, 80k iterations.
 - **STHAT_GW** — same architecture, Charbonnier + GWLoss (0.25), 100k schedule. Best PSNR-sRGB ~24.09 dB @ ~35k iter. Completed.
-- **MF_STHAT_P0.x** — active follow-up to STHAT_GW, uses `main/config.yml`, extended to a 300k-iteration schedule with a SobelLoss edge term instead of GWLoss. Currently the most recent/active run.
+- **MF_STHAT_P0.x** — follow-up to STHAT_GW, uses `main/config.yml` (100k iterations) with a SobelLoss edge term instead of GWLoss. Completed 2026-06-23; best PSNR-sRGB 24.151 dB @ 40k (see PLAN.md).
+- **MF_STHAT_P1_RefRevert** — L1 revert run (PLAN.md): restores the reference-slice residuals in ST-HAT (`FusionBlock` residual and stage-2 skip) and wires BurstAlign's `ref_feats` into the restoration module's zero-init skip projection. Config is a copy of `main/config.yml` with `total_iter: 35000`; architecture/loss otherwise identical to MF_STHAT_P0.x. Not yet run.
+- **MF_STHAT_L3_SynBase** — L3 SyntheticBurst baseline (PLAN.md), full 100k run on the standard protocol: on-the-fly official synthetic burst generation from Zurich RAW-to-RGB (14 frames, 48-px packed crops), official 300-burst val set, official `psnr_synburst` eval, plain L1 on linear RGB (`compand: false`, no edge term), fusion untouched. Not yet run.
+- **MF_STHAT_L4_OracleOn / MF_STHAT_L4_OracleOff** — L4 verdict pair (PLAN.md), 35k each: identical to L3 except `oracle_align` on/off — the On arm trains on bursts warped to the reference with the generator's ground-truth flows. The official val set ships no flows, so val inputs are never oracle-warped; read the verdict from the pair's relative numbers plus the all-ref ablation on the oracle model. Not yet run.
 
 ## _archive/
 

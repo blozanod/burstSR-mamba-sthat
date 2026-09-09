@@ -1,6 +1,7 @@
 import torch
 import cv2
 from collections import OrderedDict
+from contextlib import nullcontext
 from os import path as osp
 from tqdm import tqdm
 import pickle as pkl
@@ -103,41 +104,56 @@ class SRModel(BaseModel):
             self.gt = data['gt'].to(self.device)
 
     def optimize_parameters(self, current_iter):
-        self.optimizer_g.zero_grad()
+        # Gradient accumulation, matching MambaFusionModel.optimize_parameters:
+        # sync (zero_grad/step) only on multiples of accumulation_steps, and
+        # skip the DDP all-reduce on the intermediate micro-steps. Defaults to
+        # 1, which collapses back to a plain step every call (unchanged
+        # behavior for every config that doesn't set accumulation_steps).
+        accumulation_steps = self.opt['train'].get('accumulation_steps', 1)
 
-        self.output = self.net_g(self.lq)
-        
-        l_total = 0
-        loss_dict = OrderedDict()
-        # pixel loss
-        if self.cri_pix:
-            l_pix = self.cri_pix(self.output.float(), self.gt.float())
-            l_total += l_pix
-            loss_dict['l_pix'] = l_pix
-        # perceptual loss
-        if self.cri_perceptual:
-            l_percep, l_style = self.cri_perceptual(self.output.float(), self.gt.float())
-            if l_percep is not None:
-                l_total += l_percep
-                loss_dict['l_percep'] = l_percep
-            if l_style is not None:
-                l_total += l_style
-                loss_dict['l_style'] = l_style
-        # sobel loss
-        if self.cri_sobel:
-            l_sobel = self.cri_sobel(self.output.float(), self.gt.float())
-            l_total += l_sobel
-            loss_dict['l_sobel'] = l_sobel
+        if (current_iter - 1) % accumulation_steps == 0:
+            self.optimizer_g.zero_grad()
 
-        l_total.backward()
-        grad_clip = self.opt['train'].get('grad_clip_norm', 1.0)
-        torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), grad_clip)
-        self.optimizer_g.step()
+        is_sync_step = (current_iter % accumulation_steps == 0)
+        sync_context = self.net_g.no_sync if (not is_sync_step and self.opt['dist']) else nullcontext
 
-        self.log_dict = self.reduce_loss_dict(loss_dict)
+        with sync_context():
+            self.output = self.net_g(self.lq)
 
-        if self.ema_decay > 0:
-            self.model_ema(decay=self.ema_decay)
+            l_total = 0
+            loss_dict = OrderedDict()
+            # pixel loss
+            if self.cri_pix:
+                l_pix = self.cri_pix(self.output.float(), self.gt.float())
+                l_total += l_pix
+                loss_dict['l_pix'] = l_pix
+            # perceptual loss
+            if self.cri_perceptual:
+                l_percep, l_style = self.cri_perceptual(self.output.float(), self.gt.float())
+                if l_percep is not None:
+                    l_total += l_percep
+                    loss_dict['l_percep'] = l_percep
+                if l_style is not None:
+                    l_total += l_style
+                    loss_dict['l_style'] = l_style
+            # edge loss
+            if self.cri_edge:
+                l_edge = self.cri_edge(self.output.float(), self.gt.float())
+                l_total += l_edge
+                loss_dict['l_edge'] = l_edge
+
+            l_total = l_total / accumulation_steps
+            l_total.backward()
+
+            if is_sync_step:
+                grad_clip = self.opt['train'].get('grad_clip_norm', 1.0)
+                torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), grad_clip)
+                self.optimizer_g.step()
+
+                if self.ema_decay > 0:
+                    self.model_ema(decay=self.ema_decay)
+
+                self.log_dict = self.reduce_loss_dict(loss_dict)
 
     def test(self):
         if hasattr(self, 'net_g_ema'):

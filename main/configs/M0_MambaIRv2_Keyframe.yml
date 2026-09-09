@@ -24,12 +24,12 @@
 #      singleton burst axis (num_frames: 1 below) rather than teaching the
 #      shared datasets about non-burst models.
 #
-# Param budget: E=180, depths=[6,6,6,6], d_state=64, num_heads=[4,4,4,4]
-# (matches every other config's head count; it's what lands at 17.7M, not
-# 17.77M at [6,6,6,6] heads) -> 17.722M, verified with:
+# Param budget: E=180, depths=[6,6,6,6], d_state=64, num_heads=[6,6,6,6]
+# (head count mirrors depths here, unlike the other configs' [4,4,4,4]) ->
+# 17.768M, verified with:
 #   python3 -c "
 #   import sys; sys.path.insert(0,'analysis'); from param_budget import mambairv2
-#   print(mambairv2(IC=4,E=180,depths=[6,6,6,6],heads=[4,4,4,4],W=16,R=32,
+#   print(mambairv2(IC=4,E=180,depths=[6,6,6,6],heads=[6,6,6,6],W=16,R=32,
 #                    T=64,KF=5,MR=2,S=64,upscale=8,UF=64,RC=4)/1e6)"
 # analysis/param_budget.py's `from_config()` CLI path assumes a MambaFusionNet
 # network_g (fusion_ws, num_frames, ...) and will KeyError on this config;
@@ -68,6 +68,13 @@ datasets:
     num_frames: 1
     phase: train
     scale: 8
+    # batch_size_per_gpu x num_gpu x train.accumulation_steps = 32 (below).
+    # 8 is a starting guess, not a measured fit: this is fp32 (SRModel has no
+    # autocast), unlike the burst-fusion configs' bf16, so it is not safe to
+    # assume L5/L6's per-GPU batch headroom carries over. Before the full
+    # 300k run, confirm 8 actually fits (or find the batch that does, at a
+    # matching accumulation_steps) with:
+    #   python analysis/shape_check.py main/configs/M0_MambaIRv2_Keyframe.yml --max-batch 32
     batch_size_per_gpu: 8
     num_worker_per_gpu: 6
     dataset_enlarge_ratio: 1
@@ -91,7 +98,7 @@ network_g:
   embed_dim: 180
   d_state: 64
   depths: [6, 6, 6, 6]
-  num_heads: [4, 4, 4, 4]
+  num_heads: [6, 6, 6, 6]
   window_size: 16
   inner_rank: 32
   num_tokens: 64
@@ -112,9 +119,13 @@ path:
   experiments_root: ~
 
 train:
-  # 8 x 4 GPUs = effective batch 32, matching L5/L6. No accumulation needed:
-  # a single 48x48x4 frame is far cheaper than L5/L6's 14-frame burst at
-  # 96x96, so batch_size_per_gpu alone reaches the same effective batch.
+  # batch_size_per_gpu (8) x num_gpu (4) x accumulation_steps = 32, matching
+  # L5/L6's effective batch. accumulation_steps is omitted (defaults to 1)
+  # on the assumption that fp32 batch 8 fits -- verify with the --max-batch
+  # command above before the full run; if it recommends a smaller batch,
+  # set accumulation_steps here to the value it reports (SRModel.
+  # optimize_parameters now supports it correctly -- previously it silently
+  # ignored the key and stepped every micro-batch instead of accumulating).
   total_iter: 300000
   warmup_iter: 2000
   # SRModel.optimize_parameters reads grad_clip_norm from opt['train'], not

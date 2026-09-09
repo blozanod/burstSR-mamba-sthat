@@ -65,6 +65,8 @@ same file with `pre_align: false`) exists as the one-variable ablation.
 Two proposals shipped together (different files, so attribution stays clean per
 module). Config exists; **check `experiments/` for whether it actually ran.**
 
+**Add on: L6 is currently running. PSNR ~39.9 dB**
+
 **A. BurstAlign becomes a flow pyramid, not a 2-level PCD stack:**
 
 1. A third pyramid level (lv3 at 24×24, where 1 px ≈ 16 GT px).

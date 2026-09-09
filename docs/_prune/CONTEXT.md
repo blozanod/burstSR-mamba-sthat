@@ -6,7 +6,7 @@ MambaFusion is a **RAW burst super-resolution** model. Given a burst of N short-
 
 The project is a research prototype. Training runs on an HPC cluster (4× GPU). This local WSL2 repo is used for code development and inference/analysis only — the full dataset lives at `/groups/rls/blozanod/MambaFusion/dataset/` on the cluster.
 
-**Current direction (July 2026):** see [PLAN.md](PLAN.md) — porting to the standard SyntheticBurst benchmark as the primary instrument, with a diagnosis-led repair of the burst-utilization failure documented below.
+**Current direction (July 2026):** see [PLAN.md](PLAN.md) — SyntheticBurst is the primary benchmark. The burst-utilization failure that motivated the diagnosis phase has been repaired; the June 2026 diagnostics below are kept as a record of the instruments, not as current readings.
 
 ---
 
@@ -178,9 +178,9 @@ All models, datasets, archs, and losses are registered via decorators (e.g. `@AR
 
 ---
 
-## Diagnostics Summary (June 2026 — basis for current plan)
+## Diagnostics Summary (June 2026 — historical; readings superseded by L5/L6)
 
-- **Burst ablation** (`analysis/burst_ablation.py`, P0.x @ 50k, 2377 test bursts): normal vs. all-reference-frames delta = +0.079 dB sRGB / −0.008 dB linear / +0.003 SSIM → **the model behaves as single-image SR**.
+- **Burst ablation** (`analysis/burst_ablation.py`, P0.x @ 50k, RealBSR): **superseded — do not cite.** Measured on the pre-L5 packed-RGGB architecture. The current model extracts multi-dB gain from the burst; re-measure on the live checkpoint before quoting any figure.
 - **Offset analysis** (`analysis/offset_analysis.py`): lv1 DCN offsets shrink 0.45 → 0.17 px over training; lv2 ~0.14 px; cascade ~0.57 px.
 - **Gate-A motion** (`analysis/gate_a_motion.py`): real inter-frame motion median **0.895 packed px** (≈1.8 raw px, ≈7 GT px), with a tail past 8 packed px — alignment compensates only a small fraction of real motion.
 - Outputs are blurry; hypothesized mechanism and repair ladder in [PLAN.md](PLAN.md).

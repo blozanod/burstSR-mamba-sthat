@@ -4,7 +4,7 @@
 
 ## Goal
 
-Workshop / NTIRE-tier paper. **Story (Option C, hybrid):** lead with the diagnosis — burst SR models can silently collapse into single-image SR while posting respectable PSNR — and propose the diagnostics that expose it (all-ref ablation delta as a "burst utilization" score, offset-magnitude vs. measured inter-frame motion, frame-drop curves). Land it with a repair arc: diagnostics catch the collapse in ST-HAT, localize it (L4), and a targeted fix converts a burst-ignoring model into a burst-using one, posting *competitive* (not necessarily SOTA) numbers on the standard benchmarks. The methodology is the claim; ST-HAT is the case study; the architecture contribution is ST-HAT evolved under diagnosis.
+Workshop / NTIRE-tier paper. **Story (Option C, hybrid) — premise needs restating:** the diagnostics below are still the instrument, but ST-HAT is no longer an example of the failure they were built to expose (see Evidence base). Lead with the diagnosis — burst SR models can silently collapse into single-image SR while posting respectable PSNR — and propose the diagnostics that expose it (all-ref ablation delta as a "burst utilization" score, offset-magnitude vs. measured inter-frame motion, frame-drop curves). Land it with a repair arc: diagnostics catch the collapse in ST-HAT, localize it (L4), and a targeted fix converts a burst-ignoring model into a burst-using one, posting *competitive* (not necessarily SOTA) numbers on the standard benchmarks. The methodology is the claim; ST-HAT is the case study; the architecture contribution is ST-HAT evolved under diagnosis.
 
 **Novelty constraint (verified 2026-07-24):** "Mamba for burst SR" is already published — QMambaBSR (arXiv 2408.08665, Huawei Noah's Ark/USTC), Burst Image Super-Resolution with Mamba (arXiv 2503.19634, Huawei), and a multi-scan SSM decoder paper (arXiv 2505.19668, Beihang). Mamba is not the contribution. Contribution locus = diagnostics + alignment/fusion (the original code in this repo).
 
@@ -16,9 +16,9 @@ Workshop / NTIRE-tier paper. **Story (Option C, hybrid):** lead with the diagnos
 ## Evidence base (June 2026 runs)
 
 - STHAT_GW and MF_STHAT_P0.x both plateau at ~24.0–24.15 dB PSNR-sRGB / ~31.7 linear / 0.727 SSIM. PSNR-linear peaks at 10k and *declines* thereafter.
-- Burst ablation (P0.x @ 50k, 2377 bursts): normal vs. all-ref delta = **+0.079 dB sRGB / −0.008 linear / +0.003 SSIM** → model ≈ single-image SR.
+- Burst ablation (P0.x @ 50k, RealBSR): **superseded — do not cite.** That reading was taken on the pre-L5 packed-RGGB architecture and no longer describes this model; the current all-ref delta on SyntheticBurst is multiple dB. The instrument (`burst_ablation.py`) stands; the June number does not.
 - DCN offsets: lv1 collapses 0.45 → 0.17 px over training; Gate-A real inter-frame motion median **0.895 packed px** (≈7 GT px at ×8), tail past 8 packed px. Alignment leaves ~0.7 px median error uncompensated in the model's own coordinate system.
-- Two deliberate interventions to reduce reference reliance (mean-over-frames residuals in ST_HAT; unwiring `ref_feats`) did **not** increase burst usage → the non-reference frames carry no *accessible* signal at the fusion stage. Whether that's alignment failure, fusion design, or loss-side (RealBSR GT misregistration capping the value of extra frames) is exactly what L4 disentangles.
+- Two deliberate interventions to reduce reference reliance (mean-over-frames residuals in ST_HAT; unwiring `ref_feats`) did not help and were reverted in L1. The conclusion drawn from them at the time — that non-reference frames carry no accessible signal at the fusion stage — is **superseded**: L5/L6 fusion does extract multi-dB burst gain.
 
 ## Two parallel tracks
 

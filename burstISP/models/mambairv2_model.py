@@ -9,6 +9,21 @@ from burstISP.models.sr_model import SRModel
 class MambaIRv2Model(SRModel):
     """MambaIRv2 model for image restoration."""
 
+    def feed_data(self, data):
+        # The shared burst datasets always emit lq as [B, N, C, H, W] (a
+        # keyframe-only run sets num_frames: 1). MambaIRv2 is a plain conv/
+        # attention net over [B, C, H, W], so collapse the singleton burst
+        # axis here rather than teaching the datasets about non-burst models.
+        lq = data['lq'].to(self.device)
+        if lq.dim() == 5:
+            assert lq.shape[1] == 1, (
+                f'MambaIRv2Model takes a single keyframe; got burst dim {lq.shape[1]}. '
+                'Set num_frames: 1 in the dataset config.')
+            lq = lq.squeeze(1)
+        self.lq = lq
+        if 'gt' in data:
+            self.gt = data['gt'].to(self.device)
+
     # test by partitioning
     def test(self):
         _, C, h, w = self.lq.size()

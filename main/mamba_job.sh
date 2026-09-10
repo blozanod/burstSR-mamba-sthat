@@ -65,7 +65,7 @@ echo "======================================================================"
 conda activate MambaTraining
 cd "$REPO/main"
 
-torchrun --nproc_per_node=4 train.py -opt "$CONFIG" --launcher pytorch
+torchrun --nproc_per_node=4 train.py -opt "$CONFIG" --launcher pytorch --auto_resume
 STATUS=$?
 
 echo "======================================================================"

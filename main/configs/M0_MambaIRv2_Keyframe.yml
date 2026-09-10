@@ -69,12 +69,10 @@ datasets:
     phase: train
     scale: 8
     # batch_size_per_gpu x num_gpu x train.accumulation_steps = 32 (below).
-    # 8 is a starting guess, not a measured fit: this is fp32 (SRModel has no
-    # autocast), unlike the burst-fusion configs' bf16, so it is not safe to
-    # assume L5/L6's per-GPU batch headroom carries over. Before the full
-    # 300k run, confirm 8 actually fits (or find the batch that does, at a
-    # matching accumulation_steps) with:
-    #   python analysis/shape_check.py main/configs/M0_MambaIRv2_Keyframe.yml --max-batch 32
+    # Confirmed to fit at 8 on 4xA10 under fp32. SRModel.optimize_parameters
+    # now runs the forward pass under bf16 autocast (matching L5/L6's
+    # MambaFusionModel) for iteration speed, not for memory headroom -- bf16
+    # activations are smaller, not larger, so 8 stays safe under the switch.
     batch_size_per_gpu: 8
     num_worker_per_gpu: 6
     dataset_enlarge_ratio: 1

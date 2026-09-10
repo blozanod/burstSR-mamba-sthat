@@ -118,7 +118,13 @@ class SRModel(BaseModel):
         sync_context = self.net_g.no_sync if (not is_sync_step and self.opt['dist']) else nullcontext
 
         with sync_context():
-            self.output = self.net_g(self.lq)
+            # bf16 autocast, matching MambaFusionModel.optimize_parameters:
+            # A10s get no benefit from plain fp32 here (PyTorch's matmul TF32
+            # path is off by default and this arch is Linear/Conv-heavy), and
+            # bf16 needs no GradScaler since its exponent range matches fp32.
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                self.output = self.net_g(self.lq)
+            self.output = self.output.float()
 
             l_total = 0
             loss_dict = OrderedDict()

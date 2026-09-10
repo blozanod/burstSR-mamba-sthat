@@ -1011,7 +1011,14 @@ class MambaIRv2(nn.Module):
 
         return attn_mask
 
-    def forward(self, x, residual):
+    def forward(self, x, residual=None):
+        # residual defaults to x itself: standalone use (MambaIRv2Model / SRModel
+        # call net_g with a single tensor) treats the input as its own skip
+        # connection. MambaFusionNet always passes an explicit residual
+        # (BurstAlign's reference features), so that path is unaffected.
+        if residual is None:
+            residual = x
+
         # padding
         h, w = x.shape[-2], x.shape[-1]
 

@@ -1,0 +1,178 @@
+# M0_MambaIRv2_Keyframe — MambaIRv2 alone, on the keyframe only, 300k.
+#
+# The verdict experiment for the trunk in isolation: no PreAlign, no
+# BurstAlign, no ST-HAT fusion. One packed-RGGB LR frame in, one linear-RGB
+# GT out — the burst is not read at all (num_frames: 1 below drops every
+# other frame at the dataset level). This establishes the ceiling/floor the
+# fusion stack (L5 38.21 dB, L6 ~39.9 dB) has to clear to prove the burst is
+# worth its compute, and doubles as the "restoration head at 48x48" run
+# proposed in docs/HISTORY.md's September 2026 session (E=180 [6,6,6,6]
+# d_state=64 costs 55.8 GMACs at 48x48 vs 221.0 at 96x96 — this run uses the
+# 48x48 packed grid directly, since there is no PreAlign to double it).
+#
+# Two code changes were needed to run MambaIRv2 standalone and are already
+# applied on this branch, not something to redo:
+#   1. burstISP/archs/mambairv2_arch.py: MambaIRv2.forward() required an
+#      explicit `residual` tensor (BurstAlign's reference features, inside
+#      MambaFusionNet). Standalone callers (SRModel.optimize_parameters /
+#      .test, MambaIRv2Model.test's tiled path) only ever pass one tensor.
+#      `residual` now defaults to `x` — the plain global-residual-learning
+#      form every other single-image MambaIRv2 config expects.
+#   2. burstISP/models/mambairv2_model.py: SyntheticBurstDataset/
+#      BurstImageDataset always emit lq as [B, N, C, H, W] (burst-shaped),
+#      never single images. MambaIRv2Model.feed_data() now squeezes the
+#      singleton burst axis (num_frames: 1 below) rather than teaching the
+#      shared datasets about non-burst models.
+#
+# Param budget: E=180, depths=[6,6,6,6], d_state=64, num_heads=[6,6,6,6]
+# (head count mirrors depths here, unlike the other configs' [4,4,4,4]) ->
+# 17.768M, verified with:
+#   python3 -c "
+#   import sys; sys.path.insert(0,'analysis'); from param_budget import mambairv2
+#   print(mambairv2(IC=4,E=180,depths=[6,6,6,6],heads=[6,6,6,6],W=16,R=32,
+#                    T=64,KF=5,MR=2,S=64,upscale=8,UF=64,RC=4)/1e6)"
+# analysis/param_budget.py's `from_config()` CLI path assumes a MambaFusionNet
+# network_g (fusion_ws, num_frames, ...) and will KeyError on this config;
+# the snippet above calls its generic mambairv2() piece directly instead.
+#
+# Recipe (schedule, optimizer, effective batch, loss) matches L5/L6 so a
+# delta against them is one-variable in "is there a burst at all", not in
+# the training recipe. total_iter is 300k (3x L5/L6) since this is the run
+# meant to find out how far the trunk alone actually goes, not a matched-
+# budget ablation.
+#
+# Target: 41+ dB psnr_synburst. BurstMamba's own zero-burst backbone (L=1)
+# scores 31.29 dB on RealBSR-RGB against their 33.29 dB at L=14 (docs/
+# HISTORY.md) — a ~2 dB burst contribution on that benchmark. If this run
+# lands far below 41 dB, the gap to the fusion runs is this trunk's ceiling,
+# not evidence the burst is worth more than L5/L6 already measured.
+name: M0_MambaIRv2_Keyframe_300k
+model_type: MambaIRv2Model
+scale: 8
+num_gpu: 4
+manual_seed: 42
+find_unused_parameters: false
+
+# Dataset
+datasets:
+  train:
+    name: SyntheticBurst_train
+    type: SyntheticBurstDataset
+    # Zurich RAW-to-RGB canon set root (expects <dataroot>/train/canon/*.jpg)
+    dataroot: /groups/rls/blozanod/MambaFusion/dataset/Zurich-RAW-to-RGB
+    # The keyframe-only cut: only the reference frame is ever generated, so
+    # there is no burst for the model to ignore-by-construction rather than
+    # ignore-in-architecture. Same crop size, downsample factor, and noise
+    # model as the L5/L6 protocol (see synthetic_burst_dataset.py) — a
+    # single-frame slice of the same generator, not a different pipeline.
+    num_frames: 1
+    phase: train
+    scale: 8
+    # batch_size_per_gpu x num_gpu x train.accumulation_steps = 32 (below).
+    # 8 is a starting guess, not a measured fit: this is fp32 (SRModel has no
+    # autocast), unlike the burst-fusion configs' bf16, so it is not safe to
+    # assume L5/L6's per-GPU batch headroom carries over. Before the full
+    # 300k run, confirm 8 actually fits (or find the batch that does, at a
+    # matching accumulation_steps) with:
+    #   python analysis/shape_check.py main/configs/M0_MambaIRv2_Keyframe.yml --max-batch 32
+    batch_size_per_gpu: 8
+    num_worker_per_gpu: 6
+    dataset_enlarge_ratio: 1
+
+  val:
+    name: SyntheticBurst_val
+    type: SyntheticBurstDataset
+    # Official pre-generated 300-burst val set (expects bursts/ and gt/)
+    dataroot: /groups/rls/blozanod/MambaFusion/dataset/SyntheticBurstVal
+    num_frames: 1
+    phase: val
+    scale: 8
+
+# Network — plain MambaIRv2, not MambaFusionNet. No pre_align, no
+# offset_groups, no fusion_*: those keys don't exist on this arch.
+network_g:
+  type: MambaIRv2
+  img_size: 48          # packed LR crop; this run has no PreAlign to double it
+  in_chans: 4            # packed RGGB
+  out_chans: 3           # linear RGB
+  embed_dim: 180
+  d_state: 64
+  depths: [6, 6, 6, 6]
+  num_heads: [6, 6, 6, 6]
+  window_size: 16
+  inner_rank: 32
+  num_tokens: 64
+  convffn_kernel_size: 5
+  mlp_ratio: 2
+  upsample_feat: 64
+  upscale: 8             # arch's own scale kwarg is `upscale`, not `scale`
+  img_range: 1.0
+  upsampler: 'pixelshuffle'
+  resi_connection: '1conv'
+  control_net: false     # do not zero-init conv_last; this is the trunk, not a control branch
+
+# Training
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+  experiments_root: ~
+
+train:
+  # batch_size_per_gpu (8) x num_gpu (4) x accumulation_steps = 32, matching
+  # L5/L6's effective batch. accumulation_steps is omitted (defaults to 1)
+  # on the assumption that fp32 batch 8 fits -- verify with the --max-batch
+  # command above before the full run; if it recommends a smaller batch,
+  # set accumulation_steps here to the value it reports (SRModel.
+  # optimize_parameters now supports it correctly -- previously it silently
+  # ignored the key and stepped every micro-batch instead of accumulating).
+  total_iter: 300000
+  warmup_iter: 2000
+  # SRModel.optimize_parameters reads grad_clip_norm from opt['train'], not
+  # opt['datasets']['train'] (that path is a MambaFusionModel-only quirk —
+  # see burstISP/models/mambafusion_model.py vs sr_model.py). It belongs here.
+  grad_clip_norm: 1.0
+
+  optim_g:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [300000]
+    restart_weights: [1]
+    eta_min: !!float 1e-6
+
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+# Validation
+val:
+  val_freq: 5000
+  save_img: false
+  metrics:
+    psnr_synburst:  # headline: official SyntheticBurst eval (vendored DBSR code)
+      type: calculate_psnr_synburst
+      boundary_ignore: 40
+      better: higher
+    psnr_linear:  # ours, kept alongside
+      type: calculate_psnr_linear
+      crop_border: 40
+      test_y_channel: false
+      better: higher
+    ssim:  # ours (linear-domain SSIM), kept alongside
+      type: calculate_ssim
+      crop_border: 40
+      input_order: CHW  # visuals are [C,H,W]; calculate_ssim defaults to HWC
+      test_y_channel: false
+      better: higher
+
+# Logging
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 10000
+  use_tb_logger: false

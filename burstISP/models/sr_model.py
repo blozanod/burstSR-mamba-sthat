@@ -161,10 +161,17 @@ class SRModel(BaseModel):
             with torch.no_grad():
                 self.output = self.net_g_ema(self.lq)
         else:
-            self.net_g.eval()
+            # Unwrap DDP before calling forward directly: dist_validation
+            # only runs on rank 0, but DDP's forward does a buffer broadcast
+            # from rank 0 on every call -- a collective the other ranks
+            # never join here (they proceed straight to the barrier after
+            # validation), which hangs rather than crashes. get_bare_model
+            # sidesteps DDP entirely; mirrors MambaFusionModel.test().
+            model = self.get_bare_model(self.net_g)
+            model.eval()
             with torch.no_grad():
-                self.output = self.net_g(self.lq)
-            self.net_g.train()
+                self.output = model(self.lq)
+            model.train()
 
     def test_selfensemble(self):
         # TODO: to be tested
@@ -197,10 +204,12 @@ class SRModel(BaseModel):
             with torch.no_grad():
                 out_list = [self.net_g_ema(aug) for aug in lq_list]
         else:
-            self.net_g.eval()
+            # Same DDP-unwrap reasoning as test() above.
+            model = self.get_bare_model(self.net_g)
+            model.eval()
             with torch.no_grad():
-                out_list = [self.net_g(aug) for aug in lq_list]
-            self.net_g.train()
+                out_list = [model(aug) for aug in lq_list]
+            model.train()
 
         # merge results
         for i in range(len(out_list)):

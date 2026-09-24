@@ -11,6 +11,7 @@ burstSR-mamba-sthat/
 │   │   ├── dcn_align_arch.py         # BurstAlign — flow pyramid + DCNv4
 │   │   ├── st_hat_fusion_arch.py     # ST-HAT fusion module
 │   │   ├── mambairv2_arch.py         # MambaIRv2 restoration trunk (adapted)
+│   │   ├── rcan3d_arch.py            # RCAN3D — 3D-conv RCAN baseline (+ frozen RAFT align)
 │   │   ├── temporal_fusion_arch.py
 │   │   ├── vgg_arch.py
 │   │   └── arch_util.py              # shared helpers (DCNv4Block, to_2tuple, ...)
@@ -46,8 +47,11 @@ burstSR-mamba-sthat/
 │   │   ├── MF_STHAT_L5_BayerSpace.yml
 │   │   ├── MF_STHAT_L5_PackedControl.yml
 │   │   ├── MF_STHAT_L6_FlowFusion.yml
-│   │   └── MF_STHAT_P1_RefRevert.yml
+│   │   ├── MF_STHAT_P1_RefRevert.yml
+│   │   ├── R3D_RCAN3D_RAFT.yml       # 3D RCAN, RAFT-aligned, 78.6 GMACs
+│   │   └── R3D_RCAN3D_NoAlign.yml    # same, align: none (control)
 │   ├── jobs/                         # HPC submission scripts
+│   │   └── rcan3d_job.sh             # RCAN3D: gates -> train -> burst ablations
 │   └── _archive/Testing_Files/       # stale prototypes, superseded by train.py
 │
 ├── analysis/
@@ -55,6 +59,7 @@ burstSR-mamba-sthat/
 │   ├── analyze_logfile.py            # log parsing / dashboards
 │   ├── param_budget.py               # analytic parameter counter (no torch)
 │   ├── fusion_cost_model.py          # analytic FLOP + activation-memory model
+│   ├── count_macs.py                 # hook-measured conv/linear MACs for a config
 │   ├── burst_ablation.py             # two_pass (all-ref) + frame_drop curves
 │   ├── offset_analysis.py            # DCN offset magnitude across checkpoints
 │   ├── fusion_attention_mass.py      # FusionBlock non-ref attention mass

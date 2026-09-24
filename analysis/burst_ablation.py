@@ -57,7 +57,8 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from burstISP.archs.mambafusion_arch import MambaFusionNet
+from burstISP.utils.registry import ARCH_REGISTRY
+import burstISP.archs  # noqa: F401  (populates ARCH_REGISTRY)
 from burstISP.data.dbsr.synthetic_burst_val_set import SyntheticBurstVal
 from burstISP.metrics.psnr_ssim import (
     calculate_psnr_srgb,
@@ -383,7 +384,10 @@ def main():
     net_opt['is_train'] = False
 
     # --- Build and load model ---
-    model = MambaFusionNet(**net_opt).to(device)
+    # Build whatever arch the config names (MambaFusionNet, RCAN3D, ...);
+    # every burst arch here takes [B, N, 4, h, w] and returns [B, 3, H, W].
+    net_opt = dict(net_opt)
+    model = ARCH_REGISTRY.get(net_opt.pop('type', 'MambaFusionNet'))(**net_opt).to(device)
     ckpt  = torch.load(args.model_path, map_location=device)
     state = ckpt.get('params_ema', ckpt.get('params', ckpt.get('state_dict', ckpt)))
     model.load_state_dict(state, strict=True)

@@ -1,0 +1,145 @@
+# R3D_RCAN3D_RAFT — 3D-conv RCAN over the RAFT-registered burst, 100k.
+#
+# The "just use 3D convs" baseline. No PreAlign, no BurstAlign, no ST-HAT, no
+# MambaIRv2: a frozen pretrained RAFT (torchvision raft_large) registers every
+# frame onto the reference, then RCAN's residual-in-residual trunk runs with
+# every conv made 3D over (frame, y, x), a (N,1,1) conv collapses the frames,
+# and RCAN's pixel-shuffle upsampler goes x8. Arch: burstISP/archs/rcan3d_arch.py.
+#
+# What it tests: with alignment handed over for free, can a plain local
+# spatio-temporal filter bank (a learned, stacked 3x3x3 bandpass) match the
+# fusion stack? Reference points: L5 38.21 dB, L6 ~39.9 dB, M0 (keyframe-only
+# MambaIRv2). The one-variable control is R3D_RCAN3D_NoAlign.yml (align: none),
+# which measures how much of the alignment the 3D kernels learn implicitly.
+#
+# Budget (per sample, 48x48 packed, N=14; RAFT excluded by design):
+#   conv_first   2D per-frame 4 -> 48          0.056 GMACs
+#   body         4 groups x 4 RCAB3D, 3x3x3   72.237      (36 convs x 2.007)
+#   conv_after_body                            2.007
+#   temporal_fuse (14,1,1)                     0.074
+#   upsample     3 x (conv 48->192, PS x2)     4.013
+#   conv_last                                  0.191
+#   TOTAL                                     78.58 GMACs   (< 80)
+#   params 2.60M. Verify: python analysis/count_macs.py <this file> --budget 80
+#
+# RAFT is not a registered submodule (see RCAN3D docstring): it is not in the
+# optimizer, DDP, the MAC/param counts, or the checkpoints. It costs wall
+# clock, not budget. Its weights download from download.pytorch.org on first
+# build; if compute nodes are offline, prefetch once on a login node:
+#   python -c "from torchvision.models.optical_flow import raft_large, Raft_Large_Weights; raft_large(weights=Raft_Large_Weights.DEFAULT)"
+# (cached under $TORCH_HOME/hub/checkpoints, default ~/.cache/torch), or set
+# network_g.flow_weights to a local state_dict path.
+#
+# Recipe is L6's — AdamW 1e-4, cosine to 1e-6 over 100k, warmup 2k, effective
+# batch 32, plain L1 on linear RGB — so the delta is architecture only. No
+# accumulation: batch 8 per GPU is ~2.5 GB of trunk activations in bf16
+# (estimate — confirm with analysis/shape_check.py before the full run).
+name: R3D_RCAN3D_RAFT_100k
+model_type: MambaFusionModel   # any [B,N,4,h,w] -> [B,3,H,W] arch; flow_opt unset
+scale: 8
+num_gpu: 4
+manual_seed: 42
+find_unused_parameters: false
+
+# Dataset
+datasets:
+  train:
+    name: SyntheticBurst_train
+    type: SyntheticBurstDataset
+    # Zurich RAW-to-RGB canon set root (expects <dataroot>/train/canon/*.jpg)
+    dataroot: /groups/rls/blozanod/MambaFusion/dataset/Zurich-RAW-to-RGB
+    num_frames: 14
+    phase: train
+    scale: 8
+    batch_size_per_gpu: 8
+    num_worker_per_gpu: 6
+    dataset_enlarge_ratio: 1
+    grad_clip_norm: 1   # MambaFusionModel reads it from here, not train:
+
+  val:
+    name: SyntheticBurst_val
+    type: SyntheticBurstDataset
+    # Official pre-generated 300-burst val set (expects bursts/ and gt/)
+    dataroot: /groups/rls/blozanod/MambaFusion/dataset/SyntheticBurstVal
+    num_frames: 14
+    phase: val
+    scale: 8
+
+# Network
+network_g:
+  type: RCAN3D
+  num_frames: 14
+  img_size: 48          # packed LR crop; unused by the arch, read by shape_check / count_macs
+  in_chans: 4           # packed RGGB
+  out_chans: 3          # linear RGB
+  num_feat: 48
+  num_group: 4
+  num_block: 4
+  reduction: 8
+  temporal_kernel: 3
+  spatial_kernel: 3
+  res_scale: 1.0
+  scale: 8              # packed-LR -> GT; 3 x PixelShuffle(2)
+  # Alignment (frozen, excluded from the budget)
+  align: raft_large     # raft_large | raft_small | none
+  flow_weights: ~       # local RAFT state_dict; ~ = torchvision download/cache
+  flow_iters: 12
+  flow_upscale: 4       # RAFT sees 192x192 pseudo-sRGB (it works at 1/8 res)
+  is_train: true
+
+# Training
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+  experiments_root: ~
+
+train:
+  accumulation_steps: 1  # 8 x 4 GPUs x 1 = effective batch 32, matches L5/L6
+  total_iter: 100000
+  warmup_iter: 2000
+  compand: false  # plain L1 on linear RGB, no mu-law companding
+
+  optim_g:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [100000]
+    restart_weights: [1]
+    eta_min: !!float 1e-6
+
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+# Validation
+val:
+  val_freq: 2500
+  save_img: false
+  metrics:
+    psnr_synburst:  # headline: official SyntheticBurst eval (vendored DBSR code)
+      type: calculate_psnr_synburst
+      boundary_ignore: 40
+      better: higher
+    psnr_linear:
+      type: calculate_psnr_linear
+      crop_border: 40
+      test_y_channel: false
+      better: higher
+    ssim:
+      type: calculate_ssim
+      crop_border: 40
+      input_order: CHW
+      test_y_channel: false
+      better: higher
+
+# Logging
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 5000
+  use_tb_logger: false

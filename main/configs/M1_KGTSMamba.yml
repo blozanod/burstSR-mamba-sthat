@@ -1,0 +1,175 @@
+# M1_KGTSMamba — MambaIRv2 on the keyframe + one tied KGTS after every ASSB.
+#
+# Arch: burstISP/archs/KGTSMamba/kgts_mamba_arch.py. Compute goes to single-
+# image SR on the packed keyframe (the M0 trunk); the other 13 frames are
+# reached only through KGTS, a recurrent (weight-tied) keyframe-gated scan over
+# flow-indexed taps, called n_inject = len(depths) times.
+#
+# Body = budget_check.py's 'table-M1' (E=180, [4]*6, d_state 64). NOTE this is
+# not M0's body ([6]*4, inner_rank 32, num_tokens 64), so M1 - M0 is not a pure
+# "burst on/off" delta. For that, run this file with M0's body values.
+#
+# Budget: `python -m burstISP.archs.KGTSMamba.budget_check M1` on a GPU. Param
+# count ~18.99M (align 0.172M, bank 0.009M, kgts 0.159M, layers 17.80M).
+#
+# Recipe matches M0/L6 (AdamW 1e-4 cosine, warmup 2k, effective batch 32, L1
+# on linear RGB) plus L6's flow curriculum.
+name: M1_KGTSMamba
+model_type: MambaFusionModel   # burst lq, bf16 autocast, flow curriculum via return_aux
+scale: 8
+num_gpu: 4
+manual_seed: 42
+find_unused_parameters: false
+
+# Dataset
+datasets:
+  train:
+    name: SyntheticBurst_train
+    type: SyntheticBurstDataset
+    dataroot: /groups/rls/blozanod/MambaFusion/dataset/Zurich-RAW-to-RGB
+    num_frames: 14
+    phase: train
+    scale: 8
+    # 4 x 4 GPUs x accumulation_steps 2 = 32. UNVERIFIED on A10: M0's trunk fit
+    # at 8, but KGTS holds (B*48*48, 2*d_inner, 56) scan inputs per injection.
+    # If it OOMs, set network_g.use_checkpoint: true first, then batch 2 x acc 4.
+    batch_size_per_gpu: 4
+    num_worker_per_gpu: 6
+    dataset_enlarge_ratio: 1
+    grad_clip_norm: 1   # MambaFusionModel reads it here, not from train:
+
+  val:
+    name: SyntheticBurst_val
+    type: SyntheticBurstDataset
+    dataroot: /groups/rls/blozanod/MambaFusion/dataset/SyntheticBurstVal
+    num_frames: 14
+    phase: val
+    scale: 8
+
+# Network
+network_g:
+  type: KGTSMamba
+
+  # ---- MambaIRv2 keyframe body (all keys M0 exposed, minus control_net) ----
+  img_size: 48           # packed LR crop; the body always runs on the packed grid
+  in_chans: 4            # packed RGGB
+  out_chans: 3           # linear RGB
+  embed_dim: 180         # also KGTS's ds
+  d_state: 64
+  depths: [4, 4, 4, 4, 4, 4]   # len(depths) = number of KGTS injections
+  num_heads: [6, 6, 6, 6, 6, 6]
+  window_size: 16
+  inner_rank: 64
+  num_tokens: 128
+  convffn_kernel_size: 5
+  mlp_ratio: 2
+  upscale: 8             # relative to the packed grid, for both align types
+  img_range: 1.0
+  upsampler: 'pixelshuffle'    # or 'pixelshuffledirect' (ignores upsample_feat)
+  upsample_feat: 64
+  resi_connection: '1conv'
+  use_checkpoint: false  # grad-checkpoint every ASSB and KGTS call
+
+  # ---- Alignment front-end (KGTSAlign) ----
+  align:
+    # 'packed': FlowAlign on the 48x48 packed frames (~4x cheaper per conv).
+    # 'bayer':  PreAlign pixel-shuffles to the 96x96 Bayer grid, FlowAlign runs
+    #           there, PostAlign folds back to 48x48.
+    type: packed
+    flow_feat: 32        # FlowAlign num_feat: pyramid + flow-head width
+    # FlowAlign in_channels. bayer: PreAlign output width (default flow_feat).
+    # packed: must be in_chans (raw frames go straight in); leave ~.
+    flow_in_chans: ~
+    # lv3 cost-volume radius in lv3 px, (2r+1)^2 channels. One lv3 px is
+    # 4 packed px = 32 GT px in 'packed' (r=1 covers the 24 GT px max
+    # translation), 2 packed px = 16 GT px in 'bayer' (needs r=2).
+    r: 2
+    num_frames: 14       # informational only; FlowAlign is frame-count agnostic
+    ref_idx: ~           # ~ -> N // 2. Also picks the keyframe.
+
+  # ---- TokenBank ----
+  token:
+    c: 64                # per-frame feature width handed to the bank (align's output)
+    d: 64                # token width; also KGTS's d
+    k: 2                 # k x k taps per frame around the flow target -> L = N*k*k
+
+  # ---- KGTS (tied across all injections) ----
+  kgts:
+    n: 16                # state / key-query size per channel
+    expand: 1            # d_inner = expand * d scan channels (pooled dims per direction)
+    heads: 4             # independent key spaces for tap admission; d_inner % heads == 0
+    norm_s: true         # LayerNorm the keyframe state before it conditions anything
+    out_gate: true       # keyframe-conditioned silu gate on pooled states
+    dt_min: 0.01
+    dt_max: 0.1
+
+# Training
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+  experiments_root: ~
+
+train:
+  accumulation_steps: 2  # 4 x 4 GPUs x 2 = effective batch 32
+  total_iter: 300000
+  warmup_iter: 2000
+  compand: false         # plain L1 on linear RGB
+
+  optim_g:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [300000]
+    restart_weights: [1]
+    eta_min: !!float 1e-6
+
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+  # FlowAlign supervision against the generator's flow_vectors (L6 recipe).
+  # KGTSMamba returns FlowAlign's own pyramid; MambaFusionModel.flow_loss
+  # rescales GT to each level from the shapes, so both align types work.
+  # Matters more here than in L6: W_c is zero-init, so KGTS sends no gradient
+  # into the alignment until it starts injecting.
+  flow_opt:
+    type: CharbonnierLoss
+    loss_weight: 1.0
+    reduction: mean
+  flow_lambda:
+    milestones: [0, 30000, 60000]
+    values: [0.5, 0.1, 0.0]
+  flow_levels: [lv1, lv2, lv3]
+
+# Validation
+val:
+  val_freq: 5000
+  save_img: false
+  metrics:
+    psnr_synburst:
+      type: calculate_psnr_synburst
+      boundary_ignore: 40
+      better: higher
+    psnr_linear:
+      type: calculate_psnr_linear
+      crop_border: 40
+      test_y_channel: false
+      better: higher
+    ssim:
+      type: calculate_ssim
+      crop_border: 40
+      input_order: CHW
+      test_y_channel: false
+      better: higher
+
+# Logging
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 10000
+  use_tb_logger: false

@@ -12,6 +12,12 @@ burstSR-mamba-sthat/
 │   │   ├── st_hat_fusion_arch.py     # ST-HAT fusion module
 │   │   ├── mambairv2_arch.py         # MambaIRv2 restoration trunk (adapted)
 │   │   ├── rcan3d_arch.py            # RCAN3D — 3D-conv RCAN baseline (+ frozen RAFT align)
+│   │   ├── KGTSMamba/                # KGTSMamba — keyframe MambaIRv2 + tied KGTS (M1)
+│   │   │   ├── kgts_mamba_arch.py    #   full model; `align` / `token` / `kgts` config dicts
+│   │   │   ├── kgts_arch.py          #   tap_gather, TokenBank, KGTS scan
+│   │   │   ├── flow_align_arch.py    #   KGTSAlign (bayer|packed), FlowAlign, Pre/PostAlign
+│   │   │   ├── mambairv2_arch.py     #   MambaIRv2 base class (unregistered copy)
+│   │   │   └── budget_check.py       #   params / GMACs / peak memory per candidate
 │   │   ├── temporal_fusion_arch.py
 │   │   ├── vgg_arch.py
 │   │   └── arch_util.py              # shared helpers (DCNv4Block, to_2tuple, ...)
@@ -41,6 +47,8 @@ burstSR-mamba-sthat/
 │   ├── test.py                       # test / inference entry point
 │   ├── config.yml                    # legacy reference config (RealBSR era)
 │   ├── configs/                      # launch configs — ALL configs live here
+│   │   ├── M0_MambaIRv2_Keyframe.yml  # keyframe-only MambaIRv2 trunk
+│   │   ├── M1_KGTSMamba.yml       # KGTSMamba
 │   │   ├── MF_STHAT_L3_SynBase.yml
 │   │   ├── MF_STHAT_L4_OracleOn.yml
 │   │   ├── MF_STHAT_L4_OracleOff.yml
@@ -90,6 +98,7 @@ burstSR-mamba-sthat/
 
 - **Registry.** Archs, datasets, models and losses register via decorators
   (`@ARCH_REGISTRY.register()`) and are selected by the `type:` key in YAML.
+  `*_arch.py` files in subfolders of `archs/` (e.g. `KGTSMamba/`) are scanned too.
 - **Configs live in `main/configs/`, never in `experiments/`.** `train.py`'s
   `make_exp_dirs()` renames the whole `experiments/<name>/` folder to
   `..._archived_<timestamp>` at the start of every run, before copying the

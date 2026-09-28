@@ -17,12 +17,18 @@ def tap_gather(feat, flow, k=2):
 
     Returns:
     taps: [B, N, k*k, C, h, w]
-    pos: [B, N, k*k, 2, h, w]
+    pos: [B, N, k*k, 2, h, w]   fp32
     valid: [B, N, k*k, h, w]
+
+    Coordinates are always fp32. Under bf16 autocast the flow arrives as bf16,
+    whose spacing is 0.25 px between 32 and 64 (0.5 px up to 128): doing the
+    xs - flow arithmetic in bf16 would quantise the sub-pixel offsets that
+    `pos` exists to carry to a quarter of a packed pixel -- coarser than the
+    1/8 px an x8 model has to resolve.
     """
     B, N, C, h, w = feat.shape
     feat = feat.reshape(B * N, C, h * w)
-    flow = flow.reshape(B * N, 2, h, w)
+    flow = flow.reshape(B * N, 2, h, w).float()
 
     ys, xs = torch.meshgrid(torch.arange(h, device=feat.device, dtype=flow.dtype),
                             torch.arange(w, device=feat.device, dtype=flow.dtype), indexing='ij')
@@ -77,7 +83,7 @@ class TokenBank(nn.Module):
 
     def forward(self, feats, flow):
         B, N, C, H, W = feats.shape
-        
+
         feats = rearrange(feats, 'b n c h w -> (b n) c h w')
         feats = self.proj(feats)
         feats = rearrange(feats, '(b n) c h w -> b n c h w', b=B)
@@ -97,16 +103,18 @@ class TokenBank(nn.Module):
 
 def ref_scan(u, delta, A, B, C, delta_bias):
     """Pure-torch selective scan (S6). Slow; this is the ground truth.
-    u, delta: (P, d, L)   A: (d, n), negative   B: (P, n, L)   C: (d, n)   delta_bias: (d,)
-    Returns y: (P, d, L). Discretization matches mamba_ssm: A_bar = exp(dt*A), B_bar*u = dt*B*u."""
-    dt = F.softplus(delta + delta_bias[:, None])                          # (P, d, L)
-    h = u.new_zeros(u.shape[0], u.shape[1], A.shape[1])                    # (P, d, n)
+    u, delta: (P, D, L)   A: (D, n), negative   B: (P, G, n, L)   C: (D, n)   delta_bias: (D,)
+    Channel c reads B's group c // (D // G) -- mamba_ssm's grouped-B layout.
+    Returns y: (P, D, L). Discretization matches mamba_ssm: A_bar = exp(dt*A), B_bar*u = dt*B*u."""
+    dt = F.softplus(delta + delta_bias[:, None])                          # (P, D, L)
+    B = B.repeat_interleave(u.shape[1] // B.shape[1], dim=1)               # (P, D, n, L)
+    h = u.new_zeros(u.shape[0], u.shape[1], A.shape[1])                    # (P, D, n)
     ys = []
     for t in range(u.shape[-1]):
-        A_bar = torch.exp(dt[:, :, t, None] * A)                           # (P, d, 1)*(d, n) -> (P, d, n)
-        Bu = (dt[:, :, t] * u[:, :, t])[:, :, None] * B[:, None, :, t]     # (P, d, 1)*(P, 1, n) -> (P, d, n)
+        A_bar = torch.exp(dt[:, :, t, None] * A)                           # (P, D, 1)*(D, n) -> (P, D, n)
+        Bu = (dt[:, :, t] * u[:, :, t])[:, :, None] * B[..., t]            # (P, D, 1)*(P, D, n) -> (P, D, n)
         h = A_bar * h + Bu
-        ys.append((h * C).sum(-1))                                         # (P, d)
+        ys.append((h * C).sum(-1))                                         # (P, D)
     return torch.stack(ys, -1)
 
 def scan(u, delta, A, B, C, delta_bias):
@@ -114,7 +122,7 @@ def scan(u, delta, A, B, C, delta_bias):
         if selective_scan_fn is None:
             raise RuntimeError("mamba_ssm not installed; ref_scan is for tests only")
         return selective_scan_fn(u, delta, A, B, C, delta_bias=delta_bias, delta_softplus=True)
-    return ref_scan(u, delta, A, B, C, delta_bias)
+    return ref_scan(u.float(), delta.float(), A, B.float(), C, delta_bias).to(u.dtype)
 
 @ARCH_REGISTRY.register()
 class KGTS(nn.Module):
@@ -126,51 +134,110 @@ class KGTS(nn.Module):
 
     One instance is called after each ASSG in MambaIRv2.
     Recurrent class - same weights.
+
+    Capacity knobs (all default to the original single-head, d-wide design
+    except norm_s / out_gate):
+
+    expand: scan width d_inner = expand * d. Each scan channel is its own
+        pooling over the L taps (its own dt, so its own admission/decay
+        profile) of its own value channel, and the injection is W_c applied to
+        the 2*d_inner final states. So d_inner -- not d -- is the number of
+        distinct things one injection can deliver to the keyframe. expand > 1
+        adds a value projection W_u: d -> d_inner and grows the scan without
+        growing the cached token bank (P*L*d), which is the memory term.
+    heads: independent key spaces. B is (heads, n) instead of (n): channel
+        block h uses key B_h = FiLM_h(W_B,h x). The keyframe-token match that
+        decides which taps a channel admits is an n-dim bilinear form
+        (C . gamma(s) . W_B x), so one head means every channel ranks taps by
+        the same criterion; several heads can specialise (e.g. one on
+        occlusion/brightness mismatch, one on sub-pixel phase). This is
+        mamba_ssm's grouped-B layout, so it costs no extra kernel launches.
+        Needs d_inner % heads == 0.
+    n: state size per channel, i.e. the dimension of that key/query space.
+    norm_s: LayerNorm on the keyframe state before it conditions anything.
+        The weights are tied across every call site, but the residual stream
+        they read grows through the ASSBs; without it the same U_delta /
+        gamma / beta / W_g see a different input scale at each call, and W_g's
+        sigmoid saturates on the deep ones.
+    out_gate: keyframe-conditioned output gate y * silu(W_z s) on the pooled
+        states before W_c -- Mamba's z-branch, driven by the keyframe instead
+        of the tokens, so each call can choose which pooled channels it reads.
+
+    Both scan directions run as ONE selective_scan call: the backward copy is
+    stacked on the channel axis (2*d_inner channels, 2*heads B-groups), as in
+    VMamba's cross-scan.
     """
-    def __init__(self, ds, d=16, n=8, dt_min=1e-2, dt_max=1e-1):
+    def __init__(self, ds, d=16, n=8, expand=1, heads=1, norm_s=True, out_gate=True,
+                 dt_min=1e-2, dt_max=1e-1):
         super().__init__()
+        di = expand * d
+        if di % heads:
+            raise ValueError(f'd_inner = expand*d = {di} must be divisible by heads = {heads}')
+        self.d, self.di, self.n, self.heads = d, di, n, heads
+
+        self.norm_s = nn.LayerNorm(ds) if norm_s else nn.Identity()
+
+        # value: u = W_u x. Identity at expand=1 (the original design: u = x).
+        self.W_u = nn.Linear(d, di, bias=False) if di != d else nn.Identity()
+
         # admission gate: dt = softplus(W_delta x + U_delta s + b)
-        self.W_delta = nn.Linear(d, d, bias=False)      # token side, cached
-        self.U_delta = nn.Linear(ds, d, bias=False)     # keyframe side, per ASSG
-        dt = torch.exp(torch.rand(d) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
+        self.W_delta = nn.Linear(d, di, bias=False)     # token side, cached
+        self.U_delta = nn.Linear(ds, di, bias=False)    # keyframe side, per ASSG
+        dt = torch.exp(torch.rand(di) * (math.log(dt_max) - math.log(dt_min)) + math.log(dt_min))
         self.delta_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))   # inverse softplus -> dt at init
- 
-        # input matrix: B = (W_B x) * gamma(s) + beta(s)   (FiLM, identity at init)
-        self.W_B = nn.Linear(d, n, bias=False)
-        self.gamma, self.beta = nn.Linear(ds, n), nn.Linear(ds, n)
+
+        # input matrix, per head: B = (W_B x) * gamma(s) + beta(s)   (FiLM, identity at init)
+        self.W_B = nn.Linear(d, heads * n, bias=False)
+        self.gamma, self.beta = nn.Linear(ds, heads * n), nn.Linear(ds, heads * n)
         nn.init.zeros_(self.gamma.weight); nn.init.ones_(self.gamma.bias)
         nn.init.zeros_(self.beta.weight); nn.init.zeros_(self.beta.bias)
- 
+
         # A = -exp(A_log) stays negative; S4D-real init. Index 0 = fwd, 1 = bwd.
-        A = torch.arange(1, n + 1, dtype=torch.float32).repeat(d, 1)       # (d, n)
-        self.A_log = nn.Parameter(torch.log(A)[None].repeat(2, 1, 1))      # (2, d, n)
-        self.C = nn.Parameter(torch.randn(2, d, n) / math.sqrt(n))         # fixed readout (not s-conditioned)
- 
+        A = torch.arange(1, n + 1, dtype=torch.float32).repeat(di, 1)      # (di, n)
+        self.A_log = nn.Parameter(torch.log(A)[None].repeat(2, 1, 1))      # (2, di, n)
+        self.C = nn.Parameter(torch.randn(2, di, n) / math.sqrt(n))        # fixed readout; s enters via gamma
+
+        # keyframe-conditioned output gate on the pooled states
+        self.W_z = nn.Linear(ds, 2 * di) if out_gate else None
+
         # injection: s <- s + g * W_c [y_fwd; y_bwd],  g = sigmoid(W_g [s; ds])
-        self.W_c = nn.Linear(2 * d, ds)
+        self.W_c = nn.Linear(2 * di, ds)
         nn.init.zeros_(self.W_c.weight); nn.init.zeros_(self.W_c.bias)     # exact identity at init
         self.W_g = nn.Linear(2 * ds, ds)
- 
+
     def precompute(self, x, valid):
-        """Token-only terms, once per forward. Invalid taps get dt ~ 0: no decay AND no admission."""
-        return x, self.W_delta(x), self.W_B(x), valid.bool()
- 
+        """Token-only terms, once per forward. Invalid taps get dt ~ 0: no decay AND no admission.
+
+        u is built here in its final scan layout -- (P, 2*d_inner, L), backward
+        copy stacked on channels -- since it is the same tensor for every call.
+        """
+        u = self.W_u(x).transpose(1, 2)                                    # (P, di, L)
+        u = torch.cat([u, u.flip(-1)], 1).contiguous()                     # (P, 2di, L)
+        return u, self.W_delta(x), self.W_B(x), valid.bool()
+
     def conditioned(self, s, cache):
-        x, dx, bx, valid = cache
-        delta = dx + self.U_delta(s).unsqueeze(1)                          # (P, L, d)
+        """s must already be normalised (norm_s)."""
+        u, dx, bx, valid = cache
+        P, L = dx.shape[:2]
+        delta = dx + self.U_delta(s).unsqueeze(1)                          # (P, L, di)
         delta = delta.masked_fill(~valid.unsqueeze(-1), -30.0)             # mask AFTER the sum
-        B = bx * self.gamma(s).unsqueeze(1) + self.beta(s).unsqueeze(1)
-        return x, delta, B
- 
+        B = bx * self.gamma(s).unsqueeze(1) + self.beta(s).unsqueeze(1)    # (P, L, heads*n)
+
+        delta = delta.transpose(1, 2)                                      # (P, di, L)
+        delta = torch.cat([delta, delta.flip(-1)], 1)                      # (P, 2di, L)
+        B = B.view(P, L, self.heads, self.n).permute(0, 2, 3, 1)           # (P, heads, n, L)
+        B = torch.cat([B, B.flip(-1)], 1)                                  # (P, 2heads, n, L)
+        # mamba_ssm wants delta and a variable B in u's dtype
+        return u, delta.to(u.dtype).contiguous(), B.to(u.dtype).contiguous()
+
     def forward(self, s, cache):
-        x, delta, B = self.conditioned(s, cache)
-        u, delta, B = (t.transpose(1, 2).contiguous() for t in (x, delta, B))     # channels-before-length
-        ys = []
-        for i in range(2):
-            if i == 1:
-                u, delta, B = u.flip(-1), delta.flip(-1), B.flip(-1)
-            y = scan(u, delta, -torch.exp(self.A_log[i]), B, self.C[i], self.delta_bias)
-            ys.append(y[..., -1])                                                    # (P, d) at end of scan
-        d_s = self.W_c(torch.cat(ys, -1))                                            # (P, ds)
-        g = torch.sigmoid(self.W_g(torch.cat([s, d_s], -1)))
+        sn = self.norm_s(s)
+        u, delta, B = self.conditioned(sn, cache)
+        A = -torch.exp(self.A_log.float()).flatten(0, 1)                   # (2di, n)
+        y = scan(u, delta, A, B, self.C.float().flatten(0, 1), self.delta_bias.float().repeat(2))
+        y = y[..., -1]                                                     # (P, 2di): [fwd; bwd] end states
+        if self.W_z is not None:
+            y = y * F.silu(self.W_z(sn))
+        d_s = self.W_c(y)                                                  # (P, ds)
+        g = torch.sigmoid(self.W_g(torch.cat([sn, d_s], -1)))
         return s + g * d_s

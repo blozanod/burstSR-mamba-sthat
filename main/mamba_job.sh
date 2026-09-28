@@ -65,6 +65,19 @@ echo "======================================================================"
 conda activate MambaTraining
 cd "$REPO/main"
 
+# KGTSMamba: ~1 min pre-flight on one GPU before committing all four --
+# CUDA scan vs reference (fwd + grads) and a training-step memory probe at
+# the config's batch. A failure here means silently wrong gradients or an
+# OOM, so do not train. See analysis/kgts_sanity.py.
+if grep -Eq '^[[:space:]]*type:[[:space:]]*KGTSMamba' "$CONFIG"; then
+    echo "  KGTSMamba pre-flight (analysis/kgts_sanity.py --skip overfit)"
+    if ! CUDA_VISIBLE_DEVICES=0 python "$REPO/analysis/kgts_sanity.py" --config "$CONFIG" --skip overfit; then
+        echo "Pre-flight FAILED; not starting training."
+        exit 1
+    fi
+    echo "======================================================================"
+fi
+
 torchrun --nproc_per_node=4 train.py -opt "$CONFIG" --launcher pytorch --auto_resume
 STATUS=$?
 

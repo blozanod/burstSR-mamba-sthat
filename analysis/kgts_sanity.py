@@ -3,6 +3,9 @@
 
     python analysis/kgts_sanity.py --config main/configs/M1_KGTSMamba.yml [--iters 1500]
 
+Exits 1 if the scan check fails or the configured batch OOMs. main/mamba_job.sh
+runs `--skip overfit` (~1 min) before every KGTSMamba job and aborts on failure.
+
 Three stages, each printing PASS/FAIL (or numbers to eyeball):
 
 1. scan   -- KGTS on CUDA (mamba_ssm selective_scan_fn, grouped B, both directions
@@ -77,7 +80,8 @@ def stage_scan(net_opt):
                       **{n: p.grad.cpu() for n, p in k.named_parameters() if p.grad is not None}})
     assert grads[1]['x'].abs().sum() > 0, 'no gradient reached the tokens'
 
-    rel = lambda a, b: ((a - b).norm() / b.norm().clamp_min(1e-12)).item()
+    # absolute floor: a parameter whose true grad is ~0 must not read as a 100% error
+    rel = lambda a, b: ((a - b).norm() / b.norm().clamp_min(1e-6)).item()
     worst = max((rel(grads[1][n], grads[0][n]), n) for n in grads[0])
     fwd = rel(outs[1], outs[0])
     ok = fwd < 1e-3 and worst[0] < 1e-2
@@ -87,6 +91,8 @@ def stage_scan(net_opt):
 
 
 def stage_memory(net_opt, batch, n_frames, lq_hw):
+    """Returns False if the configured use_checkpoint setting OOMs."""
+    ok = True
     for ckpt in sorted({bool(net_opt.get('use_checkpoint', False)), True}):
         net = build_network({**net_opt, 'use_checkpoint': ckpt}).to(DEV).train()
         torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
@@ -101,8 +107,10 @@ def stage_memory(net_opt, batch, n_frames, lq_hw):
                   f'{torch.cuda.max_memory_allocated() / 2**30:.2f} GB  ({time.time() - t:.1f}s fwd+bwd)')
         except torch.cuda.OutOfMemoryError:
             print(f'[memory]  batch {batch}  use_checkpoint={ckpt}:  OOM')
+            ok = ok and ckpt != bool(net_opt.get('use_checkpoint', False))
         del net
         torch.cuda.empty_cache()
+    return ok
 
 
 def stage_overfit(opt, net_opt, iters, batch, log_every):
@@ -188,14 +196,17 @@ def main():
     net_opt = {'type': 'KGTSMamba', **net_opt}
     skip = set(filter(None, args.skip.split(',')))
 
+    ok = True
     if 'scan' not in skip:
-        stage_scan({k: v for k, v in net_opt.items() if k != 'type'})
+        ok &= stage_scan({k: v for k, v in net_opt.items() if k != 'type'})
     if 'memory' not in skip:
         size = net_opt.get('img_size', 48)
-        stage_memory(net_opt, opt['datasets']['train']['batch_size_per_gpu'],
-                     opt['datasets']['train'].get('num_frames', 14), (size, size))
+        ok &= stage_memory(net_opt, opt['datasets']['train']['batch_size_per_gpu'],
+                           opt['datasets']['train'].get('num_frames', 14), (size, size))
     if 'overfit' not in skip:
         stage_overfit(opt, net_opt, args.iters, args.batch, args.log_every)
+    # non-zero exit lets main/mamba_job.sh refuse to launch training
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == '__main__':

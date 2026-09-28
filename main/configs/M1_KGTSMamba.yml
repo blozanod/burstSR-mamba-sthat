@@ -9,8 +9,10 @@
 # not M0's body ([6]*4, inner_rank 32, num_tokens 64), so M1 - M0 is not a pure
 # "burst on/off" delta. For that, run this file with M0's body values.
 #
-# Budget: `python -m burstISP.archs.KGTSMamba.budget_check M1` on a GPU. Param
-# count ~18.99M (align 0.172M, bank 0.009M, kgts 0.159M, layers 17.80M).
+# Budget = budget_check.py's 'M1-wide', measured on GPU at (1, 14, 4, 48, 48):
+# 19.09M params, 73.4 GMACs, 0.82 GB eval peak. align 4.06 GMACs / 0.172M,
+# kgts 12.64 GMACs / 0.260M (256 pooled dims per injection), layers 47.74 /
+# 17.80M. Run analysis/kgts_sanity.py before the first full launch.
 #
 # Recipe matches M0/L6 (AdamW 1e-4 cosine, warmup 2k, effective batch 32, L1
 # on linear RGB) plus L6's flow curriculum.
@@ -96,8 +98,8 @@ network_g:
   # ---- KGTS (tied across all injections) ----
   kgts:
     n: 16                # state / key-query size per channel
-    expand: 1            # d_inner = expand * d scan channels (pooled dims per direction)
-    heads: 4             # independent key spaces for tap admission; d_inner % heads == 0
+    expand: 2            # d_inner = expand * d scan channels (pooled dims per direction)
+    heads: 8             # independent key spaces for tap admission; d_inner % heads == 0
     norm_s: true         # LayerNorm the keyframe state before it conditions anything
     out_gate: true       # keyframe-conditioned silu gate on pooled states
     dt_min: 0.01

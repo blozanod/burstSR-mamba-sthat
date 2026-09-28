@@ -370,7 +370,7 @@ class Selective_Scan(nn.Module):
 
     def forward_core(self, x: torch.Tensor, prompt):
         B, L, C = x.shape
-        K = 1  # mambairV2 needs only 1 scan
+        K = 1  # mambairV2 needs noly 1 scan
         xs = x.permute(0, 2, 1).view(B, 1, C, L).contiguous()  # B, 1, C ,L
 
         x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
@@ -782,13 +782,12 @@ class UpsampleOneStep(nn.Sequential):
         return flops
 
 
-#@ARCH_REGISTRY.register()
+@ARCH_REGISTRY.register()
 class MambaIRv2(nn.Module):
     def __init__(self,
                  img_size=64,
                  patch_size=1,
                  in_chans=3,
-                 out_chans=3,
                  embed_dim=48,
                  d_state=8,
                  depths=(6, 6, 6, 6,),
@@ -807,17 +806,11 @@ class MambaIRv2(nn.Module):
                  img_range=1.,
                  upsampler='',
                  resi_connection='1conv',
-                 control_net=False,
-                 upsample_feat=64,
-                 residual_chans=None,
                  **kwargs):
         super().__init__()
         num_in_ch = in_chans
-        num_out_ch = out_chans
-        # Width of the reconstruction tail (conv_before_upsample -> Upsample ->
-        # conv_last). Was a hardcoded 64; exposed because it caps how much
-        # detail the upsampler can carry regardless of embed_dim.
-        num_feat = upsample_feat
+        num_out_ch = in_chans
+        num_feat = 64
         self.img_range = img_range
         if in_chans == 3:
             rgb_mean = (0.4488, 0.4371, 0.4040)
@@ -827,15 +820,8 @@ class MambaIRv2(nn.Module):
         self.upscale = upscale
         self.upsampler = upsampler
 
-        # Residual projection. The residual argument to forward() is a separate
-        # tensor from x and need not share its width: MambaFusionNet passes the
-        # fused features as x (embed_dim) and BurstAlign's reference features as
-        # the residual (num_feat). Defaults to in_chans when they do match.
-        self.skip_proj = nn.Conv2d(residual_chans if residual_chans is not None else in_chans,
-                                   embed_dim, kernel_size=1)
-
         # ------------------------- 1, shallow feature extraction ------------------------- #
-        self.conv_first = nn.Conv2d(num_in_ch, embed_dim, kernel_size=1, stride=1, padding=0)
+        self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
 
         # ------------------------- 2, deep feature extraction ------------------------- #
         self.num_layers = len(depths)
@@ -936,17 +922,6 @@ class MambaIRv2(nn.Module):
 
         self.apply(self._init_weights)
 
-        # Zero Initialize the final Layer of MambaIRv2
-        if self.upsampler in ['pixelshuffle', 'nearest+conv', ''] and control_net:
-            nn.init.zeros_(self.conv_last.weight)
-            if self.conv_last.bias is not None:
-                nn.init.zeros_(self.conv_last.bias)
-
-        # Zero Initialize the skip projection
-        nn.init.zeros_(self.skip_proj.weight)
-        if self.skip_proj.bias is not None:
-            nn.init.zeros_(self.skip_proj.bias)
-
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
@@ -981,7 +956,7 @@ class MambaIRv2(nn.Module):
     def calculate_rpi_sa(self):
         coords_h = torch.arange(self.window_size)
         coords_w = torch.arange(self.window_size)
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))  # 2, Wh, Ww
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
         coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
@@ -1011,16 +986,15 @@ class MambaIRv2(nn.Module):
 
         return attn_mask
 
-    def forward(self, x, residual=None):
-        # residual defaults to x itself: standalone use (MambaIRv2Model / SRModel
-        # call net_g with a single tensor) treats the input as its own skip
-        # connection. MambaFusionNet always passes an explicit residual
-        # (BurstAlign's reference features), so that path is unaffected.
-        if residual is None:
-            residual = x
-
+    def forward(self, x):
         # padding
-        h, w = x.shape[-2], x.shape[-1]
+        h_ori, w_ori = x.size()[-2], x.size()[-1]
+        mod = self.window_size
+        h_pad = ((h_ori + mod - 1) // mod) * mod - h_ori
+        w_pad = ((w_ori + mod - 1) // mod) * mod - w_ori
+        h, w = h_ori + h_pad, w_ori + w_pad
+        x = torch.cat([x, torch.flip(x, [2])], 2)[:, :, :h, :]
+        x = torch.cat([x, torch.flip(x, [3])], 3)[:, :, :, :w]
 
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
@@ -1031,18 +1005,18 @@ class MambaIRv2(nn.Module):
         if self.upsampler == 'pixelshuffle':
             # for classical SR
             x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x, params)) + self.skip_proj(residual)
+            x = self.conv_after_body(self.forward_features(x, params)) + x
             x = self.conv_before_upsample(x)
             x = self.conv_last(self.upsample(x))
         elif self.upsampler == 'pixelshuffledirect':
             # for lightweight SR
             x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x, params)) + self.skip_proj(residual)
+            x = self.conv_after_body(self.forward_features(x, params)) + x
             x = self.upsample(x)
         elif self.upsampler == 'nearest+conv':
             # for real-world SR
             x = self.conv_first(x)
-            x = self.conv_after_body(self.forward_features(x, params)) + self.skip_proj(residual)
+            x = self.conv_after_body(self.forward_features(x, params)) + x
             x = self.conv_before_upsample(x)
             x = self.lrelu(self.conv_up1(torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')))
             x = self.lrelu(self.conv_up2(torch.nn.functional.interpolate(x, scale_factor=2, mode='nearest')))
@@ -1054,6 +1028,9 @@ class MambaIRv2(nn.Module):
             x = x + self.conv_last(res)
 
         x = x / self.img_range + self.mean
+
+        # unpadding
+        x = x[..., :h_ori * self.upscale, :w_ori * self.upscale]
 
         return x
 

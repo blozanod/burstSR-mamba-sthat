@@ -782,7 +782,8 @@ class UpsampleOneStep(nn.Sequential):
         return flops
 
 
-@ARCH_REGISTRY.register()
+# Not registered: this copy is KGTSMamba's base class. The registry name
+# 'MambaIRv2' belongs to burstISP/archs/mambairv2_arch.py (M0 builds it).
 class MambaIRv2(nn.Module):
     def __init__(self,
                  img_size=64,
@@ -806,11 +807,14 @@ class MambaIRv2(nn.Module):
                  img_range=1.,
                  upsampler='',
                  resi_connection='1conv',
+                 out_chans=None,
+                 upsample_feat=64,
                  **kwargs):
         super().__init__()
         num_in_ch = in_chans
-        num_out_ch = in_chans
-        num_feat = 64
+        num_out_ch = in_chans if out_chans is None else out_chans
+        # width of the pixelshuffle / nearest+conv reconstruction tail
+        num_feat = upsample_feat
         self.img_range = img_range
         if in_chans == 3:
             rgb_mean = (0.4488, 0.4371, 0.4040)

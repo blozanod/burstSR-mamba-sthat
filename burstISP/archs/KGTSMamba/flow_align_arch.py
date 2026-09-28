@@ -74,7 +74,7 @@ class PostAlign(nn.Module):
         x = self.pixel_unshuffle(feats.reshape(B * N, C, H, W))
         x = self.proj(x)
 
-        f = F.avg_pool2d(flow.reshape(B * N, 2, H, W), kernel_size=2) * 0.5
+        f = F.avg_pool2d(flow.reshape(B * N, 2, H, W).float(), kernel_size=2) * 0.5
 
         return x.view(B, N, -1, H // 2, W // 2), f.view(B, N, 2, H // 2, W // 2)
 
@@ -173,6 +173,8 @@ class FlowAlign(nn.Module):
         return: [B, C, H, W]
         """
         B, C, H, W = x.size()
+        # fp32 coordinates: bf16 cannot hold sub-pixel positions past ~32 px
+        flow = flow.float()
 
         # base grid
         ys, xs = torch.meshgrid(torch.arange(H, device=x.device, dtype=flow.dtype),
@@ -191,8 +193,8 @@ class FlowAlign(nn.Module):
 
         # shift
         grid = torch.stack((gx, gy), -1)
-        return F.grid_sample(x, grid, mode='bilinear',
-                            padding_mode='zeros', align_corners=align_corners)
+        return F.grid_sample(x.float(), grid, mode='bilinear',
+                            padding_mode='zeros', align_corners=align_corners).to(x.dtype)
 
     def cost_vol(self, ref, cur, r):
         """
@@ -297,3 +299,82 @@ class FlowAlign(nn.Module):
                  for lvl, f in (('lv3', flow3), ('lv2', flow2), ('lv1', flow1b))}
 
         return flows, feat1.view(B, N, self.num_feat, H, W)
+
+
+class KGTSAlign(nn.Module):
+    """KGTSMamba's burst front-end: flow + per-frame token features on the packed grid.
+
+    One module so the whole alignment cost shows up under one name
+    (`model.align`) in parameter and FLOP counts.
+
+    type='bayer': PreAlign (packed -> Bayer grid, flow_in_chans wide) ->
+        FlowAlign on the 2x grid -> PostAlign folds features and flow back to
+        the packed grid. Flow is estimated at full Bayer resolution; every
+        FlowAlign conv runs on 4x the pixels.
+    type='packed': FlowAlign directly on the packed RGGB frames (its
+        in_channels are the raw channels), ~4x cheaper per FlowAlign conv.
+        Token features come from a small encoder over [raw frame; FlowAlign
+        lv1 features]: flow_feat can then be sized for matching alone (it
+        only has to find correspondences), while the raw samples -- the
+        sub-pixel content KGTS exists to deliver -- reach the tokens directly.
+
+    Both return feats (B, N, token_feat, h, w) and flow (B, N, 2, h, w) on the
+    packed grid in packed-pixel units, plus the FlowAlign pyramid dict (in
+    that type's own grid units: Bayer px for 'bayer', packed px for 'packed').
+
+    Args:
+        in_chans: raw channels of the packed burst (4 for RGGB).
+        type: 'bayer' | 'packed'.
+        flow_feat: FlowAlign num_feat (pyramid + flow-head width).
+        flow_in_chans: FlowAlign in_channels. 'bayer': PreAlign's output
+            width, defaults to flow_feat. 'packed': must equal in_chans (the
+            raw frames go straight in); defaults to it.
+        token_feat: width of the per-frame features handed to TokenBank (its c).
+        r: lv3 cost-volume radius, in lv3 pixels; costs (2r+1)^2 channels.
+            lv3 is 4x coarser than the grid FlowAlign runs on, so one lv3 px
+            is 2 packed px (16 GT px) in 'bayer' mode and 4 packed px (32 GT
+            px) in 'packed' mode. r=2 covers the protocol's 24 GT px max
+            translation in 'bayer'; r=1 already covers it in 'packed'.
+        num_frames: kept for config compatibility; builds nothing.
+        ref_idx: reference-frame index (None -> N // 2). Also the keyframe.
+    """
+    def __init__(self, in_chans=4, type='bayer', flow_feat=64, flow_in_chans=None, token_feat=64,
+                 r=2, num_frames=14, ref_idx=None):
+        super().__init__()
+        if type not in ('bayer', 'packed'):
+            raise ValueError(f"align.type must be 'bayer' or 'packed', got {type!r}")
+        self.type = type
+        self.ref_idx = ref_idx
+        self.token_feat = token_feat
+
+        if type == 'bayer':
+            flow_in_chans = flow_in_chans or flow_feat
+            self.prealign = PreAlign(in_chans, flow_in_chans)
+            self.flowalign = FlowAlign(flow_in_chans, flow_feat, num_frames=num_frames, r=r, ref_idx=ref_idx)
+            self.postalign = PostAlign(flow_feat, token_feat)
+        else:
+            flow_in_chans = flow_in_chans or in_chans
+            if flow_in_chans != in_chans:
+                raise ValueError(f"align.type='packed' feeds the raw frames to FlowAlign, so flow_in_chans "
+                                 f"({flow_in_chans}) must equal in_chans ({in_chans})")
+            self.flowalign = FlowAlign(in_chans, flow_feat, num_frames=num_frames, r=r, ref_idx=ref_idx)
+            self.token_enc = nn.Sequential(
+                nn.Conv2d(in_chans + flow_feat, token_feat, kernel_size=3, padding=1),
+                nn.LeakyReLU(0.1, inplace=True),
+                nn.Conv2d(token_feat, token_feat, kernel_size=3, padding=1),
+                nn.LeakyReLU(0.1, inplace=True),
+            )
+
+    def forward(self, burst, ref_idx):
+        """burst: (B, N, in_chans, h, w) packed, normalised.
+        Returns feats (B, N, token_feat, h, w), flow (B, N, 2, h, w) fp32 packed px, flows dict."""
+        if self.type == 'bayer':
+            flows, feats = self.flowalign(self.prealign(burst), ref_idx=ref_idx)
+            feats, flow = self.postalign(feats, flows['lv1'])
+            return feats, flow, flows
+
+        B, N, C, h, w = burst.shape
+        flows, feats = self.flowalign(burst, ref_idx=ref_idx)
+        x = torch.cat([burst, feats], 2).reshape(B * N, -1, h, w)
+        feats = self.token_enc(x).view(B, N, self.token_feat, h, w)
+        return feats, flows['lv1'].float(), flows

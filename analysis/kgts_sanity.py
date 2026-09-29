@@ -56,6 +56,7 @@ def psnr(a, b):
 
 def stage_scan(net_opt):
     """KGTS with the config's shapes, small P: kernel vs reference, fp32."""
+    torch.backends.cuda.matmul.allow_tf32 = False     # TF32 Linears alone would miss the 1e-3 fwd bar
     kg = dict(net_opt.get('kgts', {}))
     kg.pop('d', None); kg.pop('ds', None)
     d, ds = net_opt.get('token', {}).get('d', 16), net_opt['embed_dim']
@@ -72,7 +73,9 @@ def stage_scan(net_opt):
 
     outs, grads = [], []
     for k, dev in ((k_cpu, 'cpu'), (k_gpu, DEV)):
-        xs, ss = x.to(dev).requires_grad_(), s.to(dev).requires_grad_()
+        # fresh leaves per device: x.to("cpu") returns x itself, so requires_grad_ on it
+        # would make the later x.to("cuda") a non-leaf whose .grad is never populated
+        xs, ss = (t.detach().clone().to(dev).requires_grad_() for t in (x, s))
         out = k(ss, k.precompute(xs, valid.to(dev)))
         out.pow(2).mean().backward()
         outs.append(out.detach().cpu())

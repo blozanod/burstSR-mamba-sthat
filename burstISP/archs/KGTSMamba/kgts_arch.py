@@ -83,7 +83,7 @@ class TokenBank(nn.Module):
 
     def forward(self, feats, flow):
         B, N, C, H, W = feats.shape
-
+        
         feats = rearrange(feats, 'b n c h w -> (b n) c h w')
         feats = self.proj(feats)
         feats = rearrange(feats, '(b n) c h w -> b n c h w', b=B)
@@ -136,7 +136,7 @@ class KGTS(nn.Module):
     Recurrent class - same weights.
 
     Capacity knobs (all default to the original single-head, d-wide design
-    except norm_s / out_gate):
+    except norm_s / out_gate / out_norm):
 
     expand: scan width d_inner = expand * d. Each scan channel is its own
         pooling over the L taps (its own dt, so its own admission/decay
@@ -162,12 +162,19 @@ class KGTS(nn.Module):
     out_gate: keyframe-conditioned output gate y * silu(W_z s) on the pooled
         states before W_c -- Mamba's z-branch, driven by the keyframe instead
         of the tokens, so each call can choose which pooled channels it reads.
+    out_norm: LayerNorm on the pooled end states before the gate and W_c
+        (Mamba2 norms here too). At init they are ~1e-3 RMS against a keyframe
+        state of ~1 (dt starts at 1e-2..1e-1), and Adam moves each W_c weight
+        by ~lr per step whatever the gradient scale, so without it the
+        injection stays negligible for thousands of steps while the body
+        trains as single-image SR. W_c stays zero-init: still an exact
+        identity at step 0, but the first steps already inject O(lr * width).
 
     Both scan directions run as ONE selective_scan call: the backward copy is
     stacked on the channel axis (2*d_inner channels, 2*heads B-groups), as in
     VMamba's cross-scan.
     """
-    def __init__(self, ds, d=16, n=8, expand=1, heads=1, norm_s=True, out_gate=True,
+    def __init__(self, ds, d=16, n=8, expand=1, heads=1, norm_s=True, out_gate=True, out_norm=True,
                  dt_min=1e-2, dt_max=1e-1):
         super().__init__()
         di = expand * d
@@ -197,7 +204,8 @@ class KGTS(nn.Module):
         self.A_log = nn.Parameter(torch.log(A)[None].repeat(2, 1, 1))      # (2, di, n)
         self.C = nn.Parameter(torch.randn(2, di, n) / math.sqrt(n))        # fixed readout; s enters via gamma
 
-        # keyframe-conditioned output gate on the pooled states
+        # unit-scale pooled states, then the keyframe-conditioned output gate
+        self.out_norm = nn.LayerNorm(2 * di) if out_norm else nn.Identity()
         self.W_z = nn.Linear(ds, 2 * di) if out_gate else None
 
         # injection: s <- s + g * W_c [y_fwd; y_bwd],  g = sigmoid(W_g [s; ds])
@@ -235,7 +243,7 @@ class KGTS(nn.Module):
         u, delta, B = self.conditioned(sn, cache)
         A = -torch.exp(self.A_log.float()).flatten(0, 1)                   # (2di, n)
         y = scan(u, delta, A, B, self.C.float().flatten(0, 1), self.delta_bias.float().repeat(2))
-        y = y[..., -1]                                                     # (P, 2di): [fwd; bwd] end states
+        y = self.out_norm(y[..., -1])                                      # (P, 2di): [fwd; bwd] end states
         if self.W_z is not None:
             y = y * F.silu(self.W_z(sn))
         d_s = self.W_c(y)                                                  # (P, ds)

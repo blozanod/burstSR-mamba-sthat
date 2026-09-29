@@ -83,7 +83,7 @@ class TokenBank(nn.Module):
 
     def forward(self, feats, flow):
         B, N, C, H, W = feats.shape
-        
+
         feats = rearrange(feats, 'b n c h w -> (b n) c h w')
         feats = self.proj(feats)
         feats = rearrange(feats, '(b n) c h w -> b n c h w', b=B)

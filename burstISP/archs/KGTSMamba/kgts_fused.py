@@ -103,18 +103,18 @@ if triton is not None:
         p64, pm, dm, ch, n, pd_m, pn_m, dn_m, dn, hn, ud, bias, gam, bet, q, a0, a1, c0, c1 = _consts(
             tl.program_id(0), h, P, UD, BIAS, GAM, BET, Q, A, C, DI, H, DH, N, HAS_AFF, BLOCK_P, DH_P, N_P)
         hf = tl.zeros((BLOCK_P, DH_P, N_P), dtype=tl.float32)   # forward scan state
-        yb = tl.zeros((BLOCK_P, DH_P), dtype=tl.float32)        # backward scan's end state, closed form
+        hb = tl.zeros((BLOCK_P, DH_P, N_P), dtype=tl.float32)   # backward scan's end state, closed form
         S = tl.zeros((BLOCK_P, DH_P), dtype=tl.float32)         # sum of dt over the taps before t
         for t in range(0, L):
             row, u, v, bx, kx, logit, dt, B = _tap(t, p64, pm, h, ch, n, pd_m, pn_m, DX, U, BX, KX, VALID,
                                                    ud, bias, gam, bet, q, L, scale, DI, H, N, HAS_AFF)
             wB = (dt * u)[:, :, None] * B[:, None, :]
-            yb += tl.sum(c1 * tl.exp(a1 * S[:, :, None]) * wB, axis=2)
+            hb += tl.exp(a1 * S[:, :, None]) * wB
             hf = tl.exp(dt[:, :, None] * a0) * hf + wB
             S += dt
         yo = p64[:, None] * (2 * DI) + ch[None, :]
         tl.store(Y + yo, tl.sum(c0 * hf, axis=2), mask=pd_m)
-        tl.store(Y + yo + DI, yb, mask=pd_m)
+        tl.store(Y + yo + DI, tl.sum(c1 * hb, axis=2), mask=pd_m)
 
     @triton.jit
     def _bwd(DX, U, BX, KX, Q, VALID, UD, BIAS, GAM, BET, A, C, GY,
@@ -129,30 +129,36 @@ if triton is not None:
         gf = tl.load(GY + yo, mask=pd_m, other=0.).to(tl.float32)[:, :, None]
         gb = tl.load(GY + yo + DI, mask=pd_m, other=0.).to(tl.float32)[:, :, None]
 
-        # pass 1: T = sum dt, and G_b = sum_s G^b_s, where G^b_s = dy_b/d(sum_{r<s} dt_r) at tap s
+        # Reductions over the pixel block (parameter gradients) and over n are kept out of the
+        # tap loops: per-tap cross-thread reductions made this kernel ~9x the forward's time.
+        # pass 1: T = sum dt, and Gb = the backward scan's end state per n (the same sum as
+        # the forward kernel's): dy_b/d(sum_{r<s} dt_r) summed over the taps s is c1 gb a1 . Gb
         S = tl.zeros((BLOCK_P, DH_P), dtype=tl.float32)
-        Gb = tl.zeros((BLOCK_P, DH_P), dtype=tl.float32)
+        Gb = tl.zeros((BLOCK_P, DH_P, N_P), dtype=tl.float32)
         for t in range(0, L):
             row, u, v, bx, kx, logit, dt, B = _tap(t, p64, pm, h, ch, n, pd_m, pn_m, DX, U, BX, KX, VALID,
                                                    ud, bias, gam, bet, q, L, scale, DI, H, N, HAS_AFF)
             wB = (dt * u)[:, :, None] * B[:, None, :]
-            Gb += tl.sum(c1 * gb * tl.exp(a1 * S[:, :, None]) * a1 * wB, axis=2)
+            Gb += tl.exp(a1 * S[:, :, None]) * wB
             S += dt
         T = S
+        cb = c1 * gb * a1                                        # dy_b / d(decay) weight per n
 
-        # pass 2: every gradient. kf / kb = dy/dh at tap t of the fwd / bwd scan (C g exp(A tau)).
+        # pass 2: every gradient. kf, c1 gb eb = dy/dh at tap t of the fwd / bwd scan (C g exp(A tau)).
         S = tl.zeros((BLOCK_P, DH_P), dtype=tl.float32)
-        cumGb = tl.zeros((BLOCK_P, DH_P), dtype=tl.float32)
+        cumGb = tl.zeros((BLOCK_P, DH_P, N_P), dtype=tl.float32)
         hf = tl.zeros((BLOCK_P, DH_P, N_P), dtype=tl.float32)
         gud = tl.zeros((BLOCK_P, DH_P), dtype=tl.float32)
         ggam = tl.zeros((BLOCK_P, N_P), dtype=tl.float32)
         gbet = tl.zeros((BLOCK_P, N_P), dtype=tl.float32)
         gq = tl.zeros((BLOCK_P, N_P), dtype=tl.float32)
-        gbias = tl.zeros((DH_P,), dtype=tl.float32)
-        ga0 = tl.zeros((DH_P, N_P), dtype=tl.float32)
-        ga1 = tl.zeros((DH_P, N_P), dtype=tl.float32)
-        gc0 = tl.zeros((DH_P, N_P), dtype=tl.float32)
-        gc1 = tl.zeros((DH_P, N_P), dtype=tl.float32)
+        # per-pixel parameter-gradient terms, summed over the pixel block after the loop:
+        # dC0 = sum gf ef wB, dA0 = C0 sum gf ef wB tauf; dC1 / dA1 the same with gb, eb, S
+        gbias = tl.zeros((BLOCK_P, DH_P), dtype=tl.float32)
+        mf = tl.zeros((BLOCK_P, DH_P, N_P), dtype=tl.float32)
+        tf = tl.zeros((BLOCK_P, DH_P, N_P), dtype=tl.float32)
+        mb = tl.zeros((BLOCK_P, DH_P, N_P), dtype=tl.float32)
+        tb = tl.zeros((BLOCK_P, DH_P, N_P), dtype=tl.float32)
         for t in range(0, L):
             row, u, v, bx, kx, logit, dt, B = _tap(t, p64, pm, h, ch, n, pd_m, pn_m, DX, U, BX, KX, VALID,
                                                    ud, bias, gam, bet, q, L, scale, DI, H, N, HAS_AFF)
@@ -161,24 +167,24 @@ if triton is not None:
             tauf = tl.maximum(T - S - dt, 0.0)                    # sum of dt after t (fwd decay of tap t)
             ef = tl.exp(a0 * tauf[:, :, None])
             eb = tl.exp(a1 * S[:, :, None])                       # sum of dt before t (bwd decay of tap t)
+            ebw = eb * wB
+            efw = gf * ef * wB
             kf = c0 * gf * ef
-            kb = c1 * gb * eb
-            k = kf + kb
+            k = kf + c1 * gb * eb
             kB = tl.sum(k * B[:, None, :], axis=2)
             af = tl.exp(dt[:, :, None] * a0)
+            cumGb += ebw
             # dt_t: as a weight (w = dt u); fwd: it decays every earlier tap (via the state before t);
-            # bwd: it decays every later tap (G_b minus the running sum up to t)
-            gdt = u * kB + tl.sum(kf * a0 * af * hf, axis=2)
+            # bwd: it decays every later tap (Gb minus the running sum up to and including t)
+            gdt = u * kB + tl.sum(kf * a0 * af * hf + cb * (Gb - cumGb), axis=2)
             hf = af * hf + wB
-            cumGb += tl.sum(kb * a1 * wB, axis=2)
-            gdt += Gb - cumGb
             glogit = gdt / (1.0 + tl.exp(-logit))                 # softplus' = sigmoid
             glv = tl.where(v[:, None], glogit, 0.0)               # invalid taps: logit = -30 + b
             off = row[:, None] * DI + ch[None, :]
             tl.store(GDX + off, glv, mask=pd_m)
             tl.store(GU + off, dt * kB, mask=pd_m)
             gud += glv
-            gbias += tl.sum(glogit, axis=0)                      # masked pixels contribute exactly 0
+            gbias += glogit                                       # masked pixels contribute exactly 0
             gB = tl.sum(k * w[:, :, None], axis=1)               # (pixels, n): summed over the head's channels
             offn = row[:, None] * (H * N) + h * N + n[None, :]
             tl.store(GBX + offn, gB * gam, mask=pn_m)
@@ -188,10 +194,10 @@ if triton is not None:
                 ga = tl.sum(glv, axis=1) * scale
                 tl.store(GKX + offn, ga[:, None] * q, mask=pn_m)
                 gq += ga[:, None] * kx
-            gc0 += tl.sum(gf * ef * wB, axis=0)
-            gc1 += tl.sum(gb * eb * wB, axis=0)
-            ga0 += tl.sum(kf * tauf[:, :, None] * wB, axis=0)
-            ga1 += tl.sum(kb * S[:, :, None] * wB, axis=0)
+            mf += efw
+            tf += efw * tauf[:, :, None]
+            mb += gb * ebw
+            tb += gb * ebw * S[:, :, None]
             S += dt
 
         tl.store(GUD + p64[:, None] * DI + ch[None, :], gud, mask=pd_m)
@@ -200,11 +206,11 @@ if triton is not None:
         if HAS_AFF:
             tl.store(GQ + hn, gq, mask=pn_m)
         pb = pid.to(tl.int64)
-        tl.store(PBIAS + pb * DI + ch, gbias, mask=dm)
-        tl.store(PAC + (pb * 4 + 0) * DI * N + dn, ga0, mask=dn_m)
-        tl.store(PAC + (pb * 4 + 1) * DI * N + dn, ga1, mask=dn_m)
-        tl.store(PAC + (pb * 4 + 2) * DI * N + dn, gc0, mask=dn_m)
-        tl.store(PAC + (pb * 4 + 3) * DI * N + dn, gc1, mask=dn_m)
+        tl.store(PBIAS + pb * DI + ch, tl.sum(gbias, axis=0), mask=dm)
+        tl.store(PAC + (pb * 4 + 0) * DI * N + dn, tl.sum(c0 * tf, axis=0), mask=dn_m)
+        tl.store(PAC + (pb * 4 + 1) * DI * N + dn, tl.sum(c1 * tb, axis=0), mask=dn_m)
+        tl.store(PAC + (pb * 4 + 2) * DI * N + dn, tl.sum(mf, axis=0), mask=dn_m)
+        tl.store(PAC + (pb * 4 + 3) * DI * N + dn, tl.sum(mb, axis=0), mask=dn_m)
 
 
 def _meta(dx, valid, A, kx):

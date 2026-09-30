@@ -18,7 +18,7 @@ BODY = dict(upscale=8, window_size=16, convffn_kernel_size=5, img_size=48)
 M1_BODY = dict(embed_dim=180, depths=[4] * 6, num_heads=[6] * 6, d_state=64, inner_rank=64,
                num_tokens=128, mlp_ratio=2., upsampler='pixelshuffle', upsample_feat=64)
 # the KGTS corrections switched off (see KGTS / TokenBank docstrings)
-ORIG_TOKEN = dict(pos_freqs=(), norm=False, mark_ref=False)
+ORIG_TOKEN = dict(pos_freqs=(), norm=False, mark_ref=False, pin_ref=False)
 ORIG_KGTS = dict(affinity=False, dt_norm=False)
 CONFIGS = {
     # the original KGTS: d=16, n=8, one head -- 32 dims injected per call

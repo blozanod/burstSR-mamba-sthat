@@ -89,6 +89,10 @@ class TokenBank(nn.Module):
     mark_ref: add a learned (zero-init) embedding to the keyframe's own taps.
         Otherwise they are indistinguishable from any other frame's, and the
         scan cannot learn to discount content the body already has.
+    pin_ref: gather the keyframe's taps at flow 0. Its estimated self-flow is
+        noise around an exact 0, and the noise's sign flips floor() between
+        the {p-1, p} and {p, p+1} tap pairs. The flow loss still sees the
+        estimate (KGTSMamba returns FlowAlign's own pyramid).
 
     Tokenizes the aligned taps once, used for every CFQ
 
@@ -96,8 +100,9 @@ class TokenBank(nn.Module):
     x: [P, L, d]
     valid: [P, L]
     """
-    def __init__(self, c, d, k=2, pos_freqs=(0.5, 1, 2, 4), norm=True, mark_ref=True):
+    def __init__(self, c, d, k=2, pos_freqs=(0.5, 1, 2, 4), norm=True, mark_ref=True, pin_ref=True):
         super().__init__()
+        self.pin_ref = pin_ref
         self.proj = nn.Conv2d(c, d, 1)
         self.register_buffer('pos_freqs', torch.tensor(pos_freqs, dtype=torch.float32).view(-1),
                              persistent=False)
@@ -123,6 +128,8 @@ class TokenBank(nn.Module):
         feats = self.norm(feats.permute(0, 2, 3, 1)).to(feats.dtype)          # (bn, h, w, d)
         feats = rearrange(feats, '(b n) h w c -> b n c h w', b=B)
 
+        if self.pin_ref and ref is not None:
+            flow = flow * (torch.arange(N, device=flow.device) != ref).view(1, N, 1, 1, 1)
         taps, pos, valid = tap_gather(feats, flow, self.k)
 
         x = rearrange(taps, 'b n k c h w -> (b h w) (n k) c')
@@ -202,8 +209,8 @@ class KGTS(nn.Module):
     Capacity knobs (expand / heads / n default to the original single-head,
     d-wide design; norm_s / out_gate / out_norm / a_max / affinity default to
     the corrected one. norm_s=out_gate=out_norm=affinity=False, a_max=n, with
-    TokenBank pos_freqs=(), norm=False, mark_ref=False, reproduce the original
-    KGTS exactly, forward and backward):
+    TokenBank pos_freqs=(), norm=False, mark_ref=pin_ref=False, reproduce the
+    original KGTS exactly, forward and backward):
 
     expand: scan width d_inner = expand * d. Each scan channel is its own
         pooling over the L taps (its own dt, so its own admission/decay

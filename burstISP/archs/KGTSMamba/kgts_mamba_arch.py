@@ -23,7 +23,7 @@ class KGTSMamba(MambaIRv2):
     align (KGTSAlign):  type ('bayer' | 'packed'), flow_feat, flow_in_chans, r,
                         num_frames, ref_idx
     token (TokenBank):  c (per-frame feature width = align's token_feat), d, k,
-                        pos_freqs, norm, mark_ref
+                        pos_freqs, norm, mark_ref, pin_ref
     kgts  (KGTS):       n, expand, heads, norm_s, out_gate, out_norm, dt_min, dt_max,
                         a_max, affinity, dt_norm
 
@@ -96,9 +96,6 @@ class KGTSMamba(MambaIRv2):
 
         # burst branch: tokens on the packed grid, flow on the grid align.type picks
         feats, flow, flows = self.align(burst, ref)               # (B, N, c, h, w), packed px
-        # The keyframe's self-flow is estimation noise around an exact 0, and its sign flips
-        # floor() between the {p-1, p} and {p, p+1} tap pairs: pin it (aux keeps the estimate).
-        flow = flow * (torch.arange(N, device=flow.device) != ref).view(1, N, 1, 1, 1)
         tok, valid = self.bank(feats, flow, ref)                  # (B*h*w, N*k*k, d)
         cache = self.kgts.precompute(tok, valid)
 

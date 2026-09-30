@@ -22,8 +22,10 @@ class KGTSMamba(MambaIRv2):
 
     align (KGTSAlign):  type ('bayer' | 'packed'), flow_feat, flow_in_chans, r,
                         num_frames, ref_idx
-    token (TokenBank):  c (per-frame feature width = align's token_feat), d, k
-    kgts  (KGTS):       n, expand, heads, norm_s, out_gate, dt_min, dt_max
+    token (TokenBank):  c (per-frame feature width = align's token_feat), d, k,
+                        pos_freqs, norm, mark_ref
+    kgts  (KGTS):       n, expand, heads, norm_s, out_gate, out_norm, dt_min, dt_max,
+                        a_max, affinity, dt_norm
 
     KGTS's d is the token d and its ds is embed_dim -- both forced by the wiring.
     They may be written in the kgts dict for readability, but must then agree.
@@ -43,7 +45,6 @@ class KGTSMamba(MambaIRv2):
         kgts = dict(kgts or {})
         token.setdefault('c', 64)
         token.setdefault('d', 16)
-        token.setdefault('k', 2)
         for key, want in (('d', token['d']), ('ds', self.embed_dim)):
             got = kgts.pop(key, want)
             if got != want:
@@ -54,7 +55,7 @@ class KGTSMamba(MambaIRv2):
         # self.apply(_init_weights), which would overwrite KGTS's zero-init W_c and
         # identity FiLM. Never call self.apply(...) on this model again.
         self.align = KGTSAlign(kwargs['in_chans'], token_feat=token['c'], **align)
-        self.bank = TokenBank(token['c'], token['d'], token['k'])
+        self.bank = TokenBank(**token)
         self.kgts = KGTS(self.embed_dim, token['d'], **kgts)
         self.n_inject = len(self.layers)
 
@@ -95,7 +96,10 @@ class KGTSMamba(MambaIRv2):
 
         # burst branch: tokens on the packed grid, flow on the grid align.type picks
         feats, flow, flows = self.align(burst, ref)               # (B, N, c, h, w), packed px
-        tok, valid = self.bank(feats, flow)                       # (B*h*w, N*k*k, d)
+        # The keyframe's self-flow is estimation noise around an exact 0, and its sign flips
+        # floor() between the {p-1, p} and {p, p+1} tap pairs: pin it (aux keeps the estimate).
+        flow = flow * (torch.arange(N, device=flow.device) != ref).view(1, N, 1, 1, 1)
+        tok, valid = self.bank(feats, flow, ref)                  # (B*h*w, N*k*k, d)
         cache = self.kgts.precompute(tok, valid)
 
         # keyframe body

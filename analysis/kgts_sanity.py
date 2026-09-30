@@ -11,7 +11,11 @@ Three stages, each printing PASS/FAIL (or numbers to eyeball):
 1. scan   -- KGTS on CUDA (mamba_ssm selective_scan_fn, grouped B, both directions
              stacked) vs the pure-torch ref_scan on CPU: forward AND gradients. Only
              the reference path was tested when KGTS was written; this is the first
-             time the kernel's grouped-B backward runs.
+             time the kernel's grouped-B backward runs. Also prints how many of the
+             N frames the configured scan reads at init: each frame's share of the
+             end states' sensitivity to its taps, and the effective count (their
+             participation ratio). The burst is a set, so a sound scan reads ~N; the
+             original S4D-real decay read ~3 of 14. Under N/2 prints a WARNING.
 2. memory -- one bf16 fwd+bwd at the config's batch_size_per_gpu on a random burst,
              with use_checkpoint as configured and forced on. Peak GB per GPU.
 3. overfit -- a fixed batch from the real training generator, trained with the
@@ -62,7 +66,10 @@ def stage_scan(net_opt):
     d, ds = net_opt.get('token', {}).get('d', 16), net_opt['embed_dim']
     torch.manual_seed(0)
     k_cpu = KGTS(ds, d, **kg)
-    for p in (k_cpu.W_c.weight, k_cpu.gamma.weight, k_cpu.beta.weight):
+    zero_init = [k_cpu.W_c.weight, k_cpu.gamma.weight, k_cpu.beta.weight]
+    if k_cpu.W_q is not None:
+        zero_init.append(k_cpu.W_q.weight)          # else the affinity term is 0 and goes untested
+    for p in zero_init:
         torch.nn.init.normal_(p, std=0.05)          # leave the identity init, or grads are trivial
     k_gpu = KGTS(ds, d, **kg).to(DEV)
     k_gpu.load_state_dict(k_cpu.state_dict())
@@ -90,6 +97,21 @@ def stage_scan(net_opt):
     ok = fwd < 1e-3 and worst[0] < 1e-2
     print(f'[scan]    fwd rel err {fwd:.2e}   worst grad rel err {worst[0]:.2e} ({worst[1]})   '
           f'{"PASS" if ok else "FAIL"}')
+
+    # which frames does this scan read at init? share of ||d end_states / d taps||^2 per frame
+    N = L // net_opt.get('token', {}).get('k', 2) ** 2
+    xs = x.detach().clone().to(DEV).requires_grad_()
+    y = k_gpu.pooled(k_gpu.norm_s(s.to(DEV)), k_gpu.precompute(xs, torch.ones_like(valid).to(DEV)))
+    acc = torch.zeros_like(xs)
+    for _ in range(8):
+        g, = torch.autograd.grad((y * torch.randn_like(y)).sum(), xs, retain_graph=True)
+        acc += g ** 2
+    share = acc.sum(-1).view(P, N, -1).sum(-1).mean(0)
+    share = (share / share.sum()).cpu()
+    eff = (1 / (share ** 2).sum()).item()
+    print(f'[scan]    frames read at init: {eff:.1f} of {N} effective; share per frame (%): '
+          + ' '.join(f'{100 * v:.0f}' for v in share.tolist())
+          + ('' if eff >= N / 2 else '   WARNING: the scan reads the burst with a recency bias (kgts.a_max)'))
     return ok
 
 

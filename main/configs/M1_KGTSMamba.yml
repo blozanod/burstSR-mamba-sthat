@@ -9,13 +9,17 @@
 # not M0's body ([6]*4, inner_rank 32, num_tokens 64), so M1 - M0 is not a pure
 # "burst on/off" delta. For that, run this file with M0's body values.
 #
-# Budget = budget_check.py's 'M1-wide', measured on GPU at (1, 14, 4, 48, 48):
-# 19.09M params, 73.4 GMACs, 0.82 GB eval peak. align 4.06 GMACs / 0.172M,
-# kgts 12.64 GMACs / 0.260M (256 pooled dims per injection), layers 47.74 /
-# 17.80M. Run analysis/kgts_sanity.py before the first full launch.
+# Budget = budget_check.py's 'M1-wide', measured on GPU at (1, 14, 4, 48, 48)
+# BEFORE the KGTS corrections (a_max / affinity / dt_norm, token pos_freqs /
+# norm / mark_ref): 19.09M params, 73.4 GMACs, 0.82 GB eval peak. align 4.06
+# GMACs / 0.172M, kgts 12.64 GMACs / 0.260M (256 pooled dims per injection),
+# layers 47.74 / 17.80M. With them: 19.12M params (kgts 0.292M, bank 0.010M,
+# counted on CPU) and ~75.0 GMACs (+1.6 analytic, mostly the cached W_k x);
+# re-measure GMACs and peak with budget_check.py. Run analysis/kgts_sanity.py
+# before the first full launch.
 #
 # Recipe matches M0/L6 (AdamW 1e-4 cosine, warmup 2k, effective batch 32, L1
-# on linear RGB) plus L6's flow curriculum.
+# on linear RGB) plus L6's flow curriculum, held at a floor (see flow_lambda).
 name: M1_KGTSMamba
 model_type: MambaFusionModel   # burst lq, bf16 autocast, flow curriculum via return_aux
 scale: 8
@@ -94,6 +98,14 @@ network_g:
     c: 64                # per-frame feature width handed to the bank (align's output)
     d: 64                # token width; also KGTS's d
     k: 2                 # k x k taps per frame around the flow target -> L = N*k*k
+    # Fourier features of the tap's sub-pixel offset, cycles per packed px (4 = the
+    # x8 HR Nyquist). [] = the original raw-offset MLP, which could only fit 42% of
+    # the variance of HR-pixel-wide (1/8 px) kernels of the offset (98% with these).
+    pos_freqs: [0.5, 1, 2, 4]
+    # LayerNorm the content features before the gather. Without it 98.6% of a token's
+    # tap-to-tap variation at init is the position code and 1.3% content (71% with).
+    norm: true
+    mark_ref: true       # learned (zero-init) embedding on the keyframe's own taps
 
   # ---- KGTS (tied across all injections) ----
   kgts:
@@ -102,9 +114,16 @@ network_g:
     heads: 8             # independent key spaces for tap admission; d_inner % heads == 0
     norm_s: true         # LayerNorm the keyframe state before it conditions anything
     out_gate: true       # keyframe-conditioned silu gate on pooled states
-    out_norm: true       # LayerNorm pooled states (~1e-3 RMS at init) so KGTS turns on early
+    out_norm: true       # LayerNorm pooled states (were ~1e-3 RMS at init before token.norm; ~1 now)
     dt_min: 0.01
     dt_max: 0.1
+    # Decay spectrum A_i = -a_max * i / n. Only the scan's LAST state is injected, so
+    # tap t is weighted by exp(A * sum of later dt): with the original S4D-real A =
+    # -(1..16) (a_max: 16) the scan read ~3 of the 14 frames at init -- 81% of the fwd
+    # sensitivity on frame 13, 80% of the bwd on frame 0. 0.5 reads 13.5 of 14.
+    a_max: 0.5
+    affinity: true       # keyframe-token <q(s), k(x_t)> in dt: the keyframe can now CHOOSE taps
+    dt_norm: false       # normalise dt over the taps (sum 1): bounds the decay whatever dt learns
 
 # Training
 path:
@@ -141,13 +160,20 @@ train:
   # rescales GT to each level from the shapes, so both align types work.
   # Matters more here than in L6: W_c is zero-init, so KGTS sends no gradient
   # into the alignment until it starts injecting.
+  # Unlike L6 it does not decay to 0. KGTS gathers taps at integer positions
+  # and hands the scan their sub-pixel offset from the flow target as
+  # geometry, so that offset only means what the position encoding learned
+  # while the flow stays geometrically right -- and nothing downstream can
+  # refine it (L6's DCN could). Past the curriculum the SR loss would reach
+  # the flow only through that offset's encoding. The floor also keeps
+  # l_flow in the training log for the whole run.
   flow_opt:
     type: CharbonnierLoss
     loss_weight: 1.0
     reduction: mean
   flow_lambda:
     milestones: [0, 30000, 60000]
-    values: [0.5, 0.1, 0.0]
+    values: [0.5, 0.1, 0.05]
   flow_levels: [lv1, lv2, lv3]
 
 # Validation

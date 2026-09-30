@@ -17,11 +17,15 @@ BURST = (1, 14, 4, 48, 48)      # benchmark input -- match what QMambaBSR / Burs
 BODY = dict(upscale=8, window_size=16, convffn_kernel_size=5, img_size=48)
 M1_BODY = dict(embed_dim=180, depths=[4] * 6, num_heads=[6] * 6, d_state=64, inner_rank=64,
                num_tokens=128, mlp_ratio=2., upsampler='pixelshuffle', upsample_feat=64)
+# the KGTS corrections switched off (see KGTS / TokenBank docstrings)
+ORIG_TOKEN = dict(pos_freqs=(), norm=False, mark_ref=False)
+ORIG_KGTS = dict(affinity=False, dt_norm=False)
 CONFIGS = {
     # the original KGTS: d=16, n=8, one head -- 32 dims injected per call
     'old-bayer64': dict(embed_dim=128, depths=[6] * 6, num_heads=[4] * 6, d_state=8, inner_rank=32,
-                        num_tokens=64, mlp_ratio=2.,
-                        align=dict(type='bayer', flow_feat=64), token=dict(c=64, d=16), kgts=dict(n=8)),
+                        num_tokens=64, mlp_ratio=2., align=dict(type='bayer', flow_feat=64),
+                        token=dict(c=64, d=16, **ORIG_TOKEN),
+                        kgts=dict(n=8, a_max=8, **ORIG_KGTS)),
     'table-M1':    dict(**M1_BODY, align=dict(type='packed', flow_feat=32),
                         token=dict(c=64, d=64), kgts=dict(n=16)),
     'M1':          dict(**M1_BODY, align=dict(type='packed', flow_feat=32),
@@ -31,6 +35,10 @@ CONFIGS = {
     # main/configs/M1_KGTSMamba.yml
     'M1-wide':     dict(**M1_BODY, align=dict(type='packed', flow_feat=32),
                         token=dict(c=64, d=64), kgts=dict(n=16, heads=8, expand=2)),
+    # M1-wide before the KGTS corrections, for the cost of the fixes
+    'M1-wide-orig': dict(**M1_BODY, align=dict(type='packed', flow_feat=32),
+                         token=dict(c=64, d=64, **ORIG_TOKEN),
+                         kgts=dict(n=16, heads=8, expand=2, a_max=16, **ORIG_KGTS)),
 }
 if len(sys.argv) > 1:
     CONFIGS = {k: v for k, v in CONFIGS.items() if k in sys.argv[1:]}

@@ -23,7 +23,7 @@
 #
 # Budget vs M1 (analytic, 48x48, 14 frames): +2.2 GMACs inject_first call, +6.4
 # refine (TokenRefine 2.2 + a second token cache 4.2), +1.3 token_blocks, +0.1 aux,
-# LK ~0 -> ~85 GMACs. Params +0.80M (untie_out 0.67M of it) -> ~19.9M. Re-measure
+# +0.1 LK -> ~85 GMACs. Params +0.80M (untie_out 0.67M of it) -> 19.92M. Re-measure
 # with budget_check.py M2 and analysis/kgts_sanity.py before the first launch.
 # Memory: refine holds a second token cache (~0.7 GB bf16 at batch 4); if batch 4
 # OOMs on A10, set use_checkpoint: true first (it checkpoints the refinement too).

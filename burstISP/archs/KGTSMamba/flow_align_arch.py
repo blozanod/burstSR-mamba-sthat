@@ -67,13 +67,14 @@ def affine_lk(burst, ref_idx, init=None, size=None, sigmas=(2.0, 1.4, 1.0, 0.7),
     correct it. On DBSR bursts (32x32 packed crops, 100 BSD100 bursts x 13 frames, all noise levels)
     it lands at ~0.08 packed px mean EPE (median ~0.065) from zero motion, the same as from a start
     0.33 px off, against ~0.35 for the affine fit of the learned flow reported in KGTSAlign's
-    docstring. It needs no training, so it is right from step 0; ~0.3 MMACs per frame. Detached: it
-    is a measurement of the burst (like the generator's flow), not a learned estimate.
+    docstring. It needs no training, so it is right from step 0; ~7 MMACs per 48x48 frame (two
+    starts x 16 iterations), ~0.1 GMACs per 14-frame burst. Detached: it is a measurement of the
+    burst (like the generator's flow), not a learned estimate.
     Robustness: a free photometric gain and Cauchy / mean-|r| weights (the first version) let a
     moving object covering 1/16 of the frame pull the estimate to 0.20 px (0.09 now). An object
-    covering 1/4 of the frame still defeats any single global model (~1 px): that is what
-    KGTSAlign's `local` hybrid is for -- a wrong global estimate is a coherent residual, so the gate
-    hands such regions to the dense flow.
+    covering 1/4 of the frame still pulls it to ~1.3 px: that is what KGTSAlign's `local` hybrid
+    is for -- a wrong global estimate is a coherent residual, so the gate hands such regions to
+    the dense flow.
     """
     B, N, C, h, w = burst.shape
     hv, wv = size or (h, w)

@@ -492,18 +492,19 @@ class KGTS(nn.Module):
         With roles, every per-tap tensor is put in its head's scan order here (the
         keys are token-side), and valid becomes per head, (P, L, heads).
         """
-        u = self.W_u(x)                                                    # (P, L, di)
-        kx = self.W_k(x) if self.W_k is not None else None                 # (P, L, heads*n)
-        dx, bx, valid = self.W_delta(x), self.W_B(x), valid.bool()
-        if self.roles is not None:
-            if extras is None:
-                raise ValueError('kgts.roles needs TokenBank side information (bank(..., extras=True))')
-            perm, valid = self.orders(valid, extras)
-            u, dx, bx = self.take(u, perm), self.take(dx, perm), self.take(bx, perm)
-            kx = self.take(kx, perm) if kx is not None else None
-        u = u.transpose(1, 2)                                              # (P, di, L)
+        if self.roles is None:
+            # (this op order is the original's: autograd sums x's gradient in creation order)
+            u = self.W_u(x).transpose(1, 2)                                # (P, di, L)
+            u = torch.cat([u, u.flip(-1)], 1).contiguous()                 # (P, 2di, L)
+            kx = self.W_k(x) if self.W_k is not None else None             # (P, L, heads*n)
+            return u, self.W_delta(x), self.W_B(x), kx, valid.bool()
+        if extras is None:
+            raise ValueError('kgts.roles needs TokenBank side information (bank(..., extras=True))')
+        perm, valid = self.orders(valid.bool(), extras)
+        u = self.take(self.W_u(x), perm).transpose(1, 2)                   # (P, di, L), per-head order
         u = torch.cat([u, u.flip(-1)], 1).contiguous()                     # (P, 2di, L)
-        return u, dx, bx, kx, valid
+        kx = self.take(self.W_k(x), perm) if self.W_k is not None else None
+        return u, self.take(self.W_delta(x), perm), self.take(self.W_B(x), perm), kx, valid
 
     @torch.no_grad()
     def orders(self, valid, extras):

@@ -120,7 +120,7 @@ network_g:
     # Decay spectrum A_i = -a_max * i / n. Only the scan's LAST state is injected, so
     # tap t is weighted by exp(A * sum of later dt): with the original S4D-real A =
     # -(1..16) (a_max: 16) the scan read ~3 of the 14 frames at init -- 81% of the fwd
-    # sensitivity on frame 13, 80% of the bwd on frame 0. 0.5 reads 13.5 of 14.
+    # sensitivity on frame 13, 80% of the bwd on frame 0. This config reads 12.8 of 14.
     a_max: 0.5
     affinity: true       # keyframe-token <q(s), k(x_t)> in dt: the keyframe can now CHOOSE taps
     dt_norm: false       # normalise dt over the taps (sum 1): bounds the decay whatever dt learns

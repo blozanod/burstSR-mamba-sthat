@@ -244,8 +244,10 @@ class KGTS(nn.Module):
         for long sequences; over L = 56 taps at dt ~ 0.05 it forgets all but
         the last few, and at init the fwd scan put 81% of its sensitivity on
         the last frame, the bwd 80% on the first: 3.0 effective frames of 14,
-        7% of it on frames 4-10. a_max = 0.5 gives 13.5 of 14. A stays
-        learnable, so recency is still available if the loss wants it.
+        5% of it on frames 4-10. a_max = 0.5 alone gives 13.5 of 14; with the
+        other corrections 12.8 (39% on frames 4-10) -- unit-scale tokens
+        spread dt wider. A stays learnable, so recency is still available if
+        the loss wants it.
     affinity: per-head keyframe-token term <W_q s, W_k x_t> / sqrt(n) in the
         dt logit. dt = softplus(W_delta x_t + U_delta s + b) cannot let the
         keyframe choose taps: U_delta s is the same for every tap of a pixel,

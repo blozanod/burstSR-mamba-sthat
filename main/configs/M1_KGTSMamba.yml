@@ -15,8 +15,11 @@
 # GMACs / 0.172M, kgts 12.64 GMACs / 0.260M (256 pooled dims per injection),
 # layers 47.74 / 17.80M. With them: 19.12M params (kgts 0.292M, bank 0.010M,
 # counted on CPU) and ~75.0 GMACs (+1.6 analytic, mostly the cached W_k x);
-# re-measure GMACs and peak with budget_check.py. Run analysis/kgts_sanity.py
-# before the first full launch.
+# re-measure GMACs and peak with budget_check.py. The alignment corrections
+# (train.flow_target + token.tap_pos, align.global_motion) add no parameters
+# and ~0 GMACs; KGTS no longer pins each call's whole (P, 2*d_inner, 56) scan
+# output for backward (~1.5 GB of training activations at batch 4).
+# Run analysis/kgts_sanity.py before the first full launch.
 #
 # Recipe matches M0/L6 (AdamW 1e-4 cosine, warmup 2k, effective batch 32, L1
 # on linear RGB) plus L6's flow curriculum, held at a floor (see flow_lambda).
@@ -92,6 +95,14 @@ network_g:
     r: 2
     num_frames: 14       # informational only; FlowAlign is frame-count agnostic
     ref_idx: ~           # ~ -> N // 2. Also picks the keyframe.
+    # Hand the tokens a robust per-frame affine fit of the packed flow instead of the
+    # dense estimate (the flow loss still sees the dense pyramid). SyntheticBurst moves
+    # every frame by exactly one affine map, so the dense estimate's local error is pure
+    # noise -- and each tap's sub-pixel position is read off this flow with nothing
+    # downstream to correct it. CPU probe (real TokenBank + KGTS, small conv body, same
+    # frozen FlowAlign, 400 iters): burst gain +0.006 dB dense, +0.019 fitted, +0.041
+    # with the generator's own flow. ~ for real bursts with local motion (RealBSR).
+    global_motion: affine
 
   # ---- TokenBank ----
   token:
@@ -107,6 +118,12 @@ network_g:
     norm: true
     mark_ref: true       # learned (zero-init) embedding on the keyframe's own taps
     pin_ref: true        # gather the keyframe at flow 0, not at its noisy self-flow estimate
+    # Where each tap's sample sits in the reference. Must name the field FlowAlign is
+    # trained as (train.flow_target; kgts_sanity's geometry stage fails on a mismatch).
+    # 'backward' = the field FlowAlign's own warps assume: q with q - flow(q) = T,
+    # max 0.005 packed px off the generator's true sample positions. The original
+    # ('target', flow read at p) was 0.072 max = 0.57 HR px on the forward field.
+    tap_pos: backward
 
   # ---- KGTS (tied across all injections) ----
   kgts:
@@ -176,6 +193,12 @@ train:
     milestones: [0, 30000, 60000]
     values: [0.5, 0.1, 0.05]
   flow_levels: [lv1, lv2, lv3]
+  # flow_vectors is a FORWARD field (frame i's pixel j shows what the reference shows
+  # at j + f(j)); FlowAlign refines by warping frame i to p - flow(p), which makes its
+  # flow a BACKWARD field w(p) = f(p - w(p)). The two differ by up to 0.07 packed px
+  # and trained on the forward one FlowAlign still landed 65% of the way to the
+  # backward one (CPU probe). Supervise the field it computes; token.tap_pos matches.
+  flow_target: backward
 
 # Validation
 val:

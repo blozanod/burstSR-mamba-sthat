@@ -11,6 +11,34 @@ from burstISP.utils import get_root_logger
 from burstISP.utils.img_util import differentiable_benchmark_isp
 
 
+def backward_flow(flow, iters=3):
+    """Forward field -> backward field, same grid and units. flow: (..., 2, h, w).
+
+    The generator's flow_vectors are a FORWARD field f: frame i's pixel j shows
+    what the reference shows at j + f(j). A warp that samples frame i at
+    p - w(p) (FlowAlign.warp, BurstAlign.warp) needs the BACKWARD field w: the
+    reference's p shows what frame i shows at p - w(p), so w(p) = f(p - w(p)).
+    They agree to first order only, off by |grad f| * |f|: up to 0.14 LR-RGB px
+    at SyntheticBurst's 1 deg rotations and 24 GT px shifts. Solved by fixed
+    point (bilinear); each step shrinks the error by |grad f| (<= 0.02).
+    """
+    shp = flow.shape
+    f = flow.reshape(-1, 2, *shp[-2:]).float()
+    h, w = shp[-2:]
+    # p - w(p) leaves the grid by up to |w|: extrapolate f linearly there (exact for the
+    # generator's affine fields) rather than clamping it
+    m = min(int(f.abs().max().ceil()) + 1, h - 1, w - 1)
+    fpad = 2 * F.pad(f, (m,) * 4, mode='replicate') - F.pad(f, (m,) * 4, mode='reflect')
+    ys, xs = torch.meshgrid(torch.arange(h, device=f.device, dtype=f.dtype),
+                            torch.arange(w, device=f.device, dtype=f.dtype), indexing='ij')
+    b = f
+    for _ in range(iters):
+        grid = torch.stack(((2 * (xs - b[:, 0] + m) + 1) / (w + 2 * m) - 1,
+                            (2 * (ys - b[:, 1] + m) + 1) / (h + 2 * m) - 1), -1)
+        b = F.grid_sample(fpad, grid, mode='bilinear', padding_mode='border', align_corners=False)
+    return b.reshape(shp)
+
+
 @MODEL_REGISTRY.register()
 class MambaFusionModel(SRModel):
     """MambaFusion model for image restoration."""
@@ -44,6 +72,11 @@ class MambaFusionModel(SRModel):
                                  f'got {len(self.flow_milestones)} and {len(self.flow_values)}')
             # Equal weight per level; keys must exist in the arch's aux dict.
             self.flow_levels = list(train_opt.get('flow_levels', ['lv1', 'lv2', 'lv3']))
+            # 'forward': the generator's flow_vectors as they are. 'backward': the field a
+            # p - flow(p) warp needs (see backward_flow); KGTSMamba pairs it with token.tap_pos.
+            self.flow_target = train_opt.get('flow_target', 'forward')
+            if self.flow_target not in ('forward', 'backward'):
+                raise ValueError(f"train.flow_target must be 'forward' or 'backward', got {self.flow_target!r}")
         else:
             self.cri_flow = None
 
@@ -78,8 +111,12 @@ class MambaFusionModel(SRModel):
         The sign needs no negation here. `synthetic_burst_dataset.py:196` says
         the content the reference sees at p sits at `p - flow(p)` in frame i,
         and `BurstAlign.warp` samples at exactly `p - flow`, so the predicted
-        flow and `flow_vectors` share a convention. The negation into DCN
+        flow and `flow_vectors` share a sign. The negation into DCN
         offset units lives in `BurstAlign.scatter_flow`, downstream of this.
+        They share the convention only to first order, though: flow_vectors is
+        a forward field and a `p - flow` warp wants the backward one (see
+        backward_flow; up to 0.07 packed px apart). train.flow_target: backward
+        supervises the latter.
 
         The reference frame is included on purpose: its ground-truth flow is
         identically zero (`flow_vectors = sample_pos_inv_all - ...[:1]`), so it
@@ -93,6 +130,8 @@ class MambaFusionModel(SRModel):
         gt = self.flow_gt
         B, N = gt.shape[0], gt.shape[1]
         gt = gt.reshape(B * N, 2, gt.shape[-2], gt.shape[-1]).float()
+        if self.flow_target == 'backward':
+            gt = backward_flow(gt)
         gt_h = gt.shape[-2]
 
         missing = [lv for lv in self.flow_levels if lv not in flows]

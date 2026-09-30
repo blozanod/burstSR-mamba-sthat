@@ -3,6 +3,44 @@ import torch.nn as nn
 import torch.nn.functional as F
 from burstISP.utils.registry import ARCH_REGISTRY
 
+
+def affine_flow_fit(flow, margin=4, iters=3, size=None):
+    """Per-frame robust least-squares fit of flow(p) = M p + t (6 dof), differentiable in `flow`.
+
+    flow: (M, 2, h, w), any dtype; fitted in fp32 and returned in flow's dtype.
+    margin: px dropped at each border of the fit region, where content leaves the view.
+    size: (h, w) of the valid region at the top-left (the unpadded image); default all.
+
+    Weights are Cauchy IRLS (detached), so textureless or occluded patches, where the
+    dense estimate wanders, do not pull the fit. The model is exact for SyntheticBurst:
+    the generator moves each frame by one affine map (shift + rotation), and its
+    flow_vectors are that map's flow field (fit residual 1e-5 px).
+    """
+    M, _, h, w = flow.shape
+    hv, wv = size or (h, w)
+    my, mx = min(margin, (hv - 1) // 2), min(margin, (wv - 1) // 2)
+    ys, xs = torch.meshgrid(torch.arange(h, device=flow.device, dtype=torch.float32),
+                            torch.arange(w, device=flow.device, dtype=torch.float32), indexing='ij')
+    # centred, unit-range coordinates keep the 3x3 normal equations well conditioned
+    X = torch.stack([xs / w - 0.5, ys / h - 0.5, torch.ones_like(xs)], -1).view(1, h * w, 3)
+    Y = flow.float().flatten(2).transpose(1, 2)                             # (M, hw, 2)
+    m = torch.zeros(h, w, device=flow.device)
+    m[my:hv - my, mx:wv - mx] = 1
+    w0 = m.view(1, h * w).expand(M, -1)
+    wt = w0
+    eye = 1e-6 * torch.eye(3, device=flow.device)
+    for it in range(iters + 1):
+        Xw = X * wt[..., None]
+        beta = torch.linalg.solve(Xw.transpose(1, 2) @ X + eye, Xw.transpose(1, 2) @ Y)   # (M, 3, 2)
+        if it == iters:
+            break
+        with torch.no_grad():
+            r = (Y - X @ beta).norm(dim=-1)                                  # (M, hw)
+            c = 2 * (r * w0).sum(1, keepdim=True) / w0.sum(1, keepdim=True)
+            wt = w0 / (1 + (r / c.clamp_min(1e-3)) ** 2)
+    return (X @ beta).transpose(1, 2).reshape(M, 2, h, w).to(flow.dtype)
+
+
 class PreAlign(nn.Module):
     """ Projects input RGGB frames into feature space and
     upsamples to Bayer grid resolution via PixelShuffle.
@@ -337,15 +375,37 @@ class KGTSAlign(nn.Module):
             translation in 'bayer'; r=1 already covers it in 'packed'.
         num_frames: kept for config compatibility; builds nothing.
         ref_idx: reference-frame index (None -> N // 2). Also the keyframe.
+        global_motion: None | 'affine'. 'affine' replaces the packed flow handed
+            to the tokens by a robust per-frame affine fit of it
+            (affine_flow_fit); the returned pyramid stays dense, so the flow
+            loss still supervises every pixel. KGTS reads each tap's sub-pixel
+            position off this flow and nothing downstream can correct it: at
+            x8, 0.1 packed px of flow error is 0.8 HR px of misplaced sample.
+            A dense per-pixel estimate from 5x5-receptive-field convs on noisy
+            RAW cannot average its noise away; one fit per frame pools
+            thousands of pixels into 6 numbers. Measured on the DBSR generator
+            (packed FlowAlign, flow_feat 32, flow loss only, 2.5k CPU iters):
+            interior lv1 EPE 0.51 -> 0.35 packed px. About half of that
+            error was per-frame global bias, which a fit cannot remove and
+            further training has to; the local half it removes outright.
+            Exact for SyntheticBurst (one affine map per frame; the fit of
+            its flow_vectors is off by 1e-5 px). For real bursts with local
+            motion (RealBSR) leave it None.
+        gm_margin: packed px at each border excluded from the fit (content that
+            leaves the view has no correspondence; SyntheticBurst's largest
+            shift is ~3.6 packed px).
     """
     def __init__(self, in_chans=4, type='bayer', flow_feat=64, flow_in_chans=None, token_feat=64,
-                 r=2, num_frames=14, ref_idx=None):
+                 r=2, num_frames=14, ref_idx=None, global_motion=None, gm_margin=4):
         super().__init__()
         if type not in ('bayer', 'packed'):
             raise ValueError(f"align.type must be 'bayer' or 'packed', got {type!r}")
+        if global_motion not in (None, 'affine'):
+            raise ValueError(f"align.global_motion must be None or 'affine', got {global_motion!r}")
         self.type = type
         self.ref_idx = ref_idx
         self.token_feat = token_feat
+        self.global_motion, self.gm_margin = global_motion, gm_margin
 
         if type == 'bayer':
             flow_in_chans = flow_in_chans or flow_feat
@@ -365,16 +425,19 @@ class KGTSAlign(nn.Module):
                 nn.LeakyReLU(0.1, inplace=True),
             )
 
-    def forward(self, burst, ref_idx):
-        """burst: (B, N, in_chans, h, w) packed, normalised.
+    def forward(self, burst, ref_idx, size=None):
+        """burst: (B, N, in_chans, h, w) packed, normalised. size: (h, w) of the unpadded
+        image at the top-left, for the global-motion fit (default: all of it).
         Returns feats (B, N, token_feat, h, w), flow (B, N, 2, h, w) fp32 packed px, flows dict."""
         if self.type == 'bayer':
             flows, feats = self.flowalign(self.prealign(burst), ref_idx=ref_idx)
             feats, flow = self.postalign(feats, flows['lv1'])
-            return feats, flow, flows
-
-        B, N, C, h, w = burst.shape
-        flows, feats = self.flowalign(burst, ref_idx=ref_idx)
-        x = torch.cat([burst, feats], 2).reshape(B * N, -1, h, w)
-        feats = self.token_enc(x).view(B, N, self.token_feat, h, w)
-        return feats, flows['lv1'].float(), flows
+        else:
+            B, N, C, h, w = burst.shape
+            flows, feats = self.flowalign(burst, ref_idx=ref_idx)
+            x = torch.cat([burst, feats], 2).reshape(B * N, -1, h, w)
+            feats = self.token_enc(x).view(B, N, self.token_feat, h, w)
+            flow = flows['lv1'].float()
+        if self.global_motion == 'affine':
+            flow = affine_flow_fit(flow.flatten(0, 1), self.gm_margin, size=size).view_as(flow)
+        return feats, flow, flows

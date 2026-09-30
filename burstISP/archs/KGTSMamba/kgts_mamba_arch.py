@@ -21,9 +21,9 @@ class KGTSMamba(MambaIRv2):
     through **kwargs. The burst branch is configured by three dicts:
 
     align (KGTSAlign):  type ('bayer' | 'packed'), flow_feat, flow_in_chans, r,
-                        num_frames, ref_idx
+                        num_frames, ref_idx, global_motion, gm_margin
     token (TokenBank):  c (per-frame feature width = align's token_feat), d, k,
-                        pos_freqs, norm, mark_ref, pin_ref
+                        pos_freqs, norm, mark_ref, pin_ref, tap_pos
     kgts  (KGTS):       n, expand, heads, norm_s, out_gate, out_norm, dt_min, dt_max,
                         a_max, affinity, dt_norm
 
@@ -95,7 +95,7 @@ class KGTSMamba(MambaIRv2):
         burst = (burst - self.mean.type_as(burst).unsqueeze(1)) * self.img_range
 
         # burst branch: tokens on the packed grid, flow on the grid align.type picks
-        feats, flow, flows = self.align(burst, ref)               # (B, N, c, h, w), packed px
+        feats, flow, flows = self.align(burst, ref, size=(h_ori, w_ori))   # (B, N, c, h, w), packed px
         tok, valid = self.bank(feats, flow, ref)                  # (B*h*w, N*k*k, d)
         cache = self.kgts.precompute(tok, valid)
 

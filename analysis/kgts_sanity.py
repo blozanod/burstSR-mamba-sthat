@@ -3,11 +3,15 @@
 
     python analysis/kgts_sanity.py --config main/configs/M1_KGTSMamba.yml [--iters 1500]
 
-Exits 1 if the scan check fails or the configured batch OOMs. main/mamba_job.sh
+Exits 1 if the geometry or scan check fails or the configured batch OOMs. main/mamba_job.sh
 runs `--skip overfit` (~1 min) before every KGTSMamba job and aborts on failure.
 
-Three stages, each printing PASS/FAIL (or numbers to eyeball):
+Four stages, each printing PASS/FAIL (or numbers to eyeball):
 
+0. geometry -- CPU, seconds, needs the train dataroot (else skipped). Feeds the generator's
+             own flow_vectors through tap_gather with the config's token settings and
+             checks every tap's position against where the generator put that sample.
+             Guards the flow sign / units, and that token.tap_pos matches train.flow_target.
 1. scan   -- KGTS on CUDA (mamba_ssm selective_scan_fn, grouped B, both directions
              stacked) vs the pure-torch ref_scan on CPU: forward AND gradients. Only
              the reference path was tested when KGTS was written; this is the first
@@ -48,6 +52,7 @@ from burstISP.archs import build_network
 from burstISP.archs.KGTSMamba import kgts_arch
 from burstISP.archs.KGTSMamba.kgts_arch import KGTS
 from burstISP.data.synthetic_burst_dataset import SyntheticBurstDataset
+from burstISP.models.mambafusion_model import backward_flow
 from burstISP.utils.options import ordered_yaml
 
 DEV = 'cuda'
@@ -115,6 +120,45 @@ def stage_scan(net_opt):
     return ok
 
 
+def stage_geometry(opt, net_opt, n=4):
+    """CPU, seconds. Feed the generator's own flow, in the convention the config trains FlowAlign
+    on (train.flow_target), through tap_gather with the config's k / tap_pos: does every
+    tap land where the generator put its sample? Catches flow sign / unit / convention errors and a
+    tap_pos that does not match flow_target, which would otherwise only show up as a burst branch
+    that helps less than it should."""
+    try:
+        ds = SyntheticBurstDataset(dict(opt['datasets']['train']))
+    except Exception as e:                                    # e.g. dataroot not mounted here
+        print(f'[geometry] SKIPPED: cannot build the train set ({e})')
+        return True
+    tok = net_opt.get('token', {})
+    k, tap_pos = tok.get('k', 2), tok.get('tap_pos', 'backward')
+    target = opt['train'].get('flow_target', 'forward')
+    errs = []
+    for i in range(n):
+        fr = ds[i]['flow_vectors'].float()                   # (N, 2, 2h, 2w): forward field, LR-RGB px
+        field = backward_flow(fr) if target == 'backward' else fr
+        fp = F.avg_pool2d(field, 2) * 0.5                     # packed px, as flow_loss projects it
+        N, _, h, w = fp.shape
+        ys, xs = torch.meshgrid(torch.arange(h).float(), torch.arange(w).float(), indexing='ij')
+        coords = torch.stack([xs, ys])[None, None].expand(1, N, 2, h, w).contiguous()
+        T, pos, valid = (t[0] for t in kgts_arch.tap_gather(coords, fp[None], k, tap_pos))
+        Tx, Ty = T[:, :, 0].long().clamp(0, w - 1), T[:, :, 1].long().clamp(0, h - 1)
+        at = lambda f: torch.stack([f[j][Ty[j], Tx[j]] for j in range(N)])
+        # frame j's packed pixel T has its R sample at LR-RGB 2T; the reference shows that at 2T + f(2T)
+        true = torch.stack([(2 * T[:, :, 0] + at(fr[:, 0, ::2, ::2])) / 2 - xs,
+                            (2 * T[:, :, 1] + at(fr[:, 1, ::2, ::2])) / 2 - ys], 2)
+        errs.append((pos - true).permute(0, 1, 3, 4, 2)[valid].abs().flatten())
+    e = torch.cat(errs)
+    exact = tap_pos == target
+    ok = bool(e.max() < (0.02 if exact else 0.15)) and (exact or tap_pos == 'target')
+    note = ('' if exact else "   (tap_pos 'target' is first-order only)" if tap_pos == 'target'
+            else '   tap_pos names a different field than train.flow_target trains')
+    print(f'[geometry] |tap pos - generator| packed px: mean {e.mean():.4f}  max {e.max():.4f} '
+          f'(= {8 * e.max():.2f} HR px)  flow_target={target} tap_pos={tap_pos}   {"PASS" if ok else "FAIL"}' + note)
+    return ok
+
+
 def stage_memory(net_opt, batch, n_frames, lq_hw):
     """Returns False if the configured use_checkpoint setting OOMs."""
     ok = True
@@ -162,6 +206,8 @@ def stage_overfit(opt, net_opt, iters, batch, log_every):
 
     def flow_terms(flows):
         gt_ = flow_gt.reshape(B * N, 2, *flow_gt.shape[-2:]).float()
+        if tr.get('flow_target', 'forward') == 'backward':
+            gt_ = backward_flow(gt_)
         loss, epe = 0, None
         for lv, f in flows.items():
             f = f.reshape(B * N, 2, *f.shape[-2:]).float()
@@ -209,7 +255,7 @@ def main():
     ap.add_argument('--iters', type=int, default=1500)
     ap.add_argument('--batch', type=int, default=2, help='overfit batch size')
     ap.add_argument('--log_every', type=int, default=100)
-    ap.add_argument('--skip', default='', help='comma list of stages to skip: scan,memory,overfit')
+    ap.add_argument('--skip', default='', help='comma list of stages to skip: geometry,scan,memory,overfit')
     args = ap.parse_args()
     assert torch.cuda.is_available(), 'needs a GPU (the point is to exercise the CUDA scan)'
     assert kgts_arch.selective_scan_fn is not None, 'mamba_ssm is not importable'
@@ -222,6 +268,8 @@ def main():
     skip = set(filter(None, args.skip.split(',')))
 
     ok = True
+    if 'geometry' not in skip:
+        ok &= stage_geometry(opt, net_opt)
     if 'scan' not in skip:
         ok &= stage_scan({k: v for k, v in net_opt.items() if k != 'type'})
     if 'memory' not in skip:

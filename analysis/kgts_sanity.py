@@ -20,6 +20,9 @@ Four stages, each printing PASS/FAIL (or numbers to eyeball):
              end states' sensitivity to its taps, and the effective count (their
              participation ratio). The burst is a set, so a sound scan reads ~N; the
              original S4D-real decay read ~3 of 14. Under N/2 prints a WARNING.
+             With kgts.fused the CUDA side IS the Triton end-state kernel (kgts_fused), so this
+             checks it against the reference; then fused vs selective_scan on the GPU at the
+             training shape (batch 4 x 48x48 pixels, bf16): ms per call and how far apart.
 2. memory -- one bf16 fwd+bwd at the config's batch_size_per_gpu on a random burst,
              with use_checkpoint as configured and forced on. Peak GB per GPU.
 3. overfit -- a fixed batch from the real training generator, trained with the
@@ -107,6 +110,8 @@ def stage_scan(net_opt):
     ok = fwd < 1e-3 and worst[0] < 1e-2
     print(f'[scan]    fwd rel err {fwd:.2e}   worst grad rel err {worst[0]:.2e} ({worst[1]})   '
           f'{"PASS" if ok else "FAIL"}')
+    if kg.get('fused'):
+        ok = bench_fused(kg, d, ds, kk, k_gpu) and ok
 
     # which frames does this scan read at init? share of ||d end_states / d taps||^2 per frame
     N = L // net_opt.get('token', {}).get('k', 2) ** 2
@@ -122,6 +127,46 @@ def stage_scan(net_opt):
     print(f'[scan]    frames read at init: {eff:.1f} of {N} effective; share per frame (%): '
           + ' '.join(f'{100 * v:.0f}' for v in share.tolist())
           + ('' if eff >= N / 2 else '   WARNING: the scan reads the burst with a recency bias (kgts.a_max)'))
+    return ok
+
+
+def bench_fused(kg, d, ds, kk, k_fused, P=4 * 48 * 48, reps=10):
+    """kgts.fused vs the selective_scan path, same weights, on the GPU at the training shape under
+    bf16 autocast: fwd+bwd time of one call (the token cache is shared, as in training) and how
+    far apart the outputs land (the scan path rounds delta and B to bf16, the kernel does not)."""
+    k_scan = KGTS(ds, d, **{**kg, 'fused': False}).to(DEV)
+    k_scan.load_state_dict(k_fused.state_dict())
+    L = 14 * kk ** 2
+    torch.manual_seed(1)
+    x, s = torch.randn(P, L, d, device=DEV), torch.randn(P, ds, device=DEV)
+    valid = torch.rand(P, L, device=DEV) > 0.1
+    ex = {'pos': torch.rand(P, L, 2, device=DEV) * 2 - 0.5, 'cons': -torch.rand(P, L, device=DEV),
+          'is_ref': (torch.arange(L) // kk ** 2 == 7).to(DEV)}
+    res = []
+    for k in (k_scan, k_fused):
+        xs, ss = x.clone().requires_grad_(), s.clone().requires_grad_()
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            cache = k.precompute(xs, valid, ex)
+
+        def call():
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                y = k.pooled(k.norm_s(ss), cache)
+            y.float().square().mean().backward(retain_graph=True)
+            return y
+        for _ in range(3):
+            call()
+        torch.cuda.synchronize()
+        t = time.time()
+        for _ in range(reps):
+            y = call()
+        torch.cuda.synchronize()
+        res.append(((time.time() - t) / reps * 1e3, y.detach().float()))
+        del cache
+    (t0, y0), (t1, y1) = res
+    rel = ((y1 - y0).norm() / y0.norm()).item()
+    ok = rel < 5e-2
+    print(f'[scan]    kgts.fused at the training shape (P={P}, L={L}, bf16): {t1:.1f} ms vs selective_scan '
+          f'{t0:.1f} ms per call, fwd+bwd ({t0 / t1:.1f}x); outputs {rel:.1e} apart   {"PASS" if ok else "FAIL"}')
     return ok
 
 

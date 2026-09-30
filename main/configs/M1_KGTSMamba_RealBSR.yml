@@ -109,6 +109,7 @@ network_g:
     dt_norm: false
     depth_embed: true
     untie_out: true
+    fused: true          # Triton end-state kernel (speed only; see M1_KGTSMamba.yml)
 
 path:
   # an M1_KGTSMamba checkpoint trained with datasets.train.outliers on (same arch)

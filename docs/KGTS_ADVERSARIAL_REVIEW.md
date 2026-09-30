@@ -12,8 +12,9 @@ Every change is a flag, off by default. **With all flags off the model reproduce
 (236dbba) bit-exactly** — state dict, output, aux flows and all 270 / 273 parameter
 gradients on two configurations, also with `W_c`, γ and `W_q` perturbed so the scan is
 live. `python analysis/kgts_cpu_checks.py` re-runs that and the other checks on any
-machine (no GPU, no mamba_ssm). `main/configs/M2_KGTSMamba.yml` switches the flags on;
-M2 − M1 is exactly this review.
+machine (no GPU, no mamba_ssm). `main/configs/M1_KGTSMamba.yml` now switches them all on
+(the queued M1 run starts with them); 236dbba's M1 is the flags-off model, so the two
+differ by exactly this review.
 
 ---
 
@@ -64,7 +65,8 @@ M2 − M1 is exactly this review.
   val = BSD100) through `rgb2rawburst` with the official transformation / noise parameters,
   keyframe at N // 2, flow_vectors kept.
 - **Not done:** no GPU, so no kernel parity for the new code paths, no peak memory, no GMACs
-  measured (analytic only). `analysis/kgts_sanity.py` and `budget_check.py M2` are the
+  measured on GPU (the counts in §9 are CPU FlopCounter + analytic scans, the method
+  budget_check uses on GPU). `analysis/kgts_sanity.py` and `budget_check.py` are the
   pre-launch gates for that (both updated for the new options);
   `analysis/kgts_cpu_checks.py` is the CPU part, committed.
 
@@ -88,11 +90,12 @@ M2 − M1 is exactly this review.
 | 12 | Zero gradient into the burst branch at step 0 | exact (W_c = 0) | `aux_head` + `train.aux_opt` | implemented, probed |
 | 13 | Synthetic training never rewards rejecting a tap | DBSR motion model | `datasets.train.outliers` (+ flow mask) | implemented, probed |
 | 14 | The burst is treated as an ordered, fixed-length sequence | scan is a recurrence; N fixed at 14 | `train.burst_aug` | implemented, tested |
-| 15 | No weight EMA | config | `train.ema_decay` in M2 | config |
+| 15 | No weight EMA | config | `train.ema_decay` in M1 | config |
 | 16 | Stochastic routing in the MambaIRv2 body at eval | two eval passes differ | proposed (outside KGTS) | not changed |
 | 17 | No noise-level conditioning | fusion weights depend on noise | proposed | not changed |
 | 18 | `out_norm` discards how much evidence was pooled | code | proposed | not changed |
 | 19 | The body re-learns single-image SR from scratch while the burst branch competes with it | M1 body ≠ M0 body | warm start from M0 (config only) | proposed |
+| 20 | `budget_check.py`'s total missed `KGTS.precompute` (outside `kgts.forward`) | M1 at 236dbba: 78.1 GMACs, header said ~75.0 | global FlopCounter total; `mamba_job.sh` gate at 90 | fixed |
 
 ---
 
@@ -141,7 +144,7 @@ worse, 5.3 px: its window weights the centre, where the object sat). That case i
 is for.
 
 Caveat: with `lk` the tokens' flow is detached, so FlowAlign's flow heads train only from
-`flow_opt` / `photo_opt`. Keep one of them on at every step (M1/M2 hold `flow_lambda` at a
+`flow_opt` / `photo_opt`. Keep one of them on at every step (M1 holds `flow_lambda` at a
 floor) or DDP with `find_unused_parameters: false` will fail. On SyntheticBurst the dense
 flow then only seeds LK (and feeds lv1 features to the token encoder in `packed` mode); an
 ablation dropping FlowAlign's lv2/lv3 and flow heads there would recover most of its ~4
@@ -173,7 +176,7 @@ heads get gradient only through the tap position codes.
 `accumulation_steps: 2` (M1) λ reaches 0.1 at optimizer iteration 15k, not 30k; with 4
 (L6) at 7.5k. `train.flow_lambda.unit: iter` converts (the same key works for the new
 `aux_lambda` / `photo_lambda`); the default stays `micro` so a resumed L6 does not change
-schedule mid-run. M2 uses `iter`.
+schedule mid-run. M1 now uses `iter`.
 
 ---
 
@@ -208,7 +211,7 @@ invalid taps kept at 0. `refine.at: [i, …]` runs it after call i and rebuilds 
 cache from the refined bank, so later calls pool *different* values than earlier ones.
 Cost per entry at M1 width: TokenRefine ~2.2 GMACs + a second cache ~4.2 GMACs, ~40k params,
 ~0.7 GB more activations at batch 4 (bf16). Checkpointed with the rest under
-`use_checkpoint`. M2 refines once, after call 2, so calls 3–6 read refined tokens.
+`use_checkpoint`. M1 refines once, after call 2, so calls 3–6 read refined tokens.
 
 What it does not do: give a frame spatial context *in its own coordinates* beyond the
 encoder's RF — that is 2.2's job. The two are complementary.
@@ -222,7 +225,7 @@ Alternatives considered:
   features for all frames", but ~8 GMACs per frame per ASSB at M1 width, i.e. +100 GMACs
   for 13 frames.
 - **Refining at every call**: each refinement pays for a new token cache (~4.2 GMACs at M1
-  width); one mid-body refinement is where M2 starts. `refine.at: [2, 4]` is the next step
+  width); one mid-body refinement is where M1 starts. `refine.at: [2, 4]` is the next step
   if the per-call ablation (§8) still shows the deep calls contributing least.
 
 ---
@@ -321,7 +324,7 @@ keeps the scan and makes its one distinctive property, the decay spectrum, usefu
   to the normalised state (every keyframe-side projection knows which depth it serves; 1.3k
   params). **`kgts.untie_out`** gives calls 1… their own `W_c` (zero-init) and `W_g` (call 0
   keeps the originals), so each depth writes into its own subspace (0.67M params at M1
-  width — the priciest item in M2; depth_embed alone is the cheap variant). Token-side
+  width — the priciest item in M1's new flags; depth_embed alone is the cheap variant). Token-side
   weights, and so the cache, stay shared.
 - **The first ASSB never sees the burst.** Injections come after each ASSB; the first one
   (1/6 of the body) denoises and builds features from the single noisy keyframe.
@@ -344,14 +347,14 @@ previous `out_norm` fix shortened this; it cannot remove it.
 **`aux_head` + `train.aux_opt`**: a 1×1 conv + pixel shuffle decodes the first call's pooled
 states straight to HR, L1 against GT. The whole burst branch is supervised from step 0,
 independently of W_c, and the aux PSNR is a live readout of what the burst branch *alone*
-carries (the "is the burst being used" question, answered every log line). M2: weight 1.0 →
+carries (the "is the burst being used" question, answered every log line). M1: weight 1.0 →
 0.1 over the first 20k iterations, then held (at 0 its parameters would be unused and DDP
 would fail; the model refuses an aux head without `aux_opt` for the same reason).
 
 ### 5.2 Schedules and averaging
 
 - `flow_lambda.unit: iter` (§1.5).
-- `ema_decay: 0.999` in M2 (validation and saving already use `net_g_ema` when present).
+- `ema_decay: 0.999` in M1 (validation and saving already use `net_g_ema` when present).
 - With `lk`, the flow floor (0.05) matters less for the tokens but keeps FlowAlign's heads
   in the graph (§1.2 caveat).
 
@@ -391,7 +394,7 @@ hard-codes the assumption. The first moving object is met at test time.
 1..max_frames non-key frames with that frame's own content displaced by 2–6 packed px (an
 independently moving object the keyframe does not show). The GT is untouched, and a
 `flow_mask` removes those pixels from the flow loss (`MambaFusionModel.flow_loss(mask=…)`;
-a level's pixel counts only if its whole footprint is valid). Off in M2 (the benchmark val
+a level's pixel counts only if its whole footprint is valid). Off in M1 (the benchmark val
 set has no outliers); on for the synthetic run that pretrains a real-data model.
 
 ### 6.2 The burst is a set of variable size (`train.burst_aug`)
@@ -403,9 +406,9 @@ stay order-free); the whole model sees burst lengths it will meet on real data.
 
 ### 6.3 Real-data config
 
-`main/configs/M2_KGTSMamba_RealBSR.yml` (untested on data): M2 + `align.local`,
+`main/configs/M1_KGTSMamba_RealBSR.yml` (untested on data): M1 + `align.local`,
 `photo_opt` instead of `flow_opt`, `compand: true`, `burst_aug` from 4 frames, fine-tuned
-from an M2 SyntheticBurst run trained with `outliers` on.
+from an M1 SyntheticBurst run trained with `outliers` on.
 
 ### 6.4 Proposed, not implemented: noise-level conditioning
 
@@ -474,24 +477,44 @@ on — both gains are at the noise floor, nothing to conclude yet):
 
 ## 9. Configs, budget, launch order
 
-| | M1 | M2 |
+`main/configs/M1_KGTSMamba.yml` carries every flag of this review (the queued M1 run
+starts with them). Only `datasets.train.outliers` is left off, on purpose: the benchmark
+val set has no outliers; turn it on for a run that pretrains a real-data model
+(`main/configs/M1_KGTSMamba_RealBSR.yml`).
+
+| at (1, 14, 4, 48, 48) | M1 at 236dbba | M1 now |
 |---|---|---|
-| params (CPU build, exact) | 19.121M | 19.919M |
+| params (exact) | 19.121M | 19.919M |
 | KGTS calls | 6 | 7 |
-| GMACs, analytic delta at 48×48, N 14 | ~75.0 | ~85 (+2.2 inject_first, +6.4 refine, +1.3 token_blocks, +0.1 aux, +0.1 LK) |
+| GMACs (FlopCounter + analytic scans) | 78.1 | 88.0 (+0.1 aux head, training only) |
+| activations saved for backward, bf16, per sample (estimate) | 2.77 GiB | 3.64 GiB (0.39 with `use_checkpoint`) |
 
-Before the first M2 launch: `python -m burstISP.archs.KGTSMamba.budget_check M1-wide M2`
-and `analysis/kgts_sanity.py --config main/configs/M2_KGTSMamba.yml` (its scan stage now
-builds role side information, so kernel parity covers the reordered path).
+The GMACs were counted on CPU exactly as `budget_check.py` counts on GPU — the selective
+scans stubbed to zero-FLOP ops (on GPU they are kernels the counter cannot see) plus its
+analytic scan terms; the `layers` row comes out at 47.74 GMACs, the GPU number in M1's old
+header. **236dbba's M1 was 78.1 GMACs, not the ~75.0 its header gave**: `budget_check.py`
+summed per-module counts, and `KGTS.precompute`'s token-side Linears (4.2 GMACs; 8.5 now,
+with the refined second cache) run outside `kgts.forward`, so no module row held them. It
+now reports the counter's global total with an `other` row. The deltas of the new M1: +2.2
+`inject_first`, +6.4 `refine` (TokenRefine 2.2 + second cache 4.2), +1.3 `token_blocks`,
++0.1 LK.
 
-Suggested ablation order, each against M1 on the same seed (35k smoke tests first):
+`main/mamba_job.sh` now gates KGTSMamba configs on it before anything else:
+`budget_check --config <cfg> --budget 90` (`MAX_GMACS=90`), then `kgts_sanity`'s scan-parity
+and memory stages as before. At batch 4 the activation estimate is ~14.6 GiB (vs ~11.1)
+before transients; the memory stage measures the real peak on the GPU and stops the job if
+the configured setting OOMs — the fallback is `use_checkpoint: true`, then batch 2 × 4.
 
-1. `align.global_motion: lk` alone — the largest expected effect and the cheapest.
-2. `+ kgts.roles` (+ `out_norm: group`) — watch burst gain and the corrupted-frame drop.
-3. `+ align.token_blocks: 2` and `+ refine.at: [2]` — separately; refine is the costly one.
-4. `+ aux_head` — watch how early the burst gain appears, and `l_aux`.
-5. `+ inject_first`, `+ depth_embed`, `+ untie_out`.
-6. Full M2; then the RealBSR fine-tune from an M2 trained with `outliers`.
+Ablations worth running against the new M1 (flags off one at a time, same seed, 35k
+smoke tests first), in order of expected information:
+
+1. `align.global_motion: affine` (the previous geometry) — the largest expected effect.
+2. `kgts.roles: ~`, `out_norm: true` — watch burst gain and the corrupted-frame drop.
+3. `refine: ~` and, separately, `align.token_blocks: 0` — refine is the costly one (6.4 GMACs).
+4. `aux_head: false` (+ drop `train.aux_opt`) — watch how early the burst gain appears.
+5. `inject_first: false`, `depth_embed: false`, `untie_out: false`.
+
+Then the RealBSR fine-tune from a SyntheticBurst M1 trained with `outliers` on.
 
 ---
 
@@ -508,10 +531,14 @@ Suggested ablation order, each against M1 on the same seed (35k smoke tests firs
   `burst_aug`, masked `flow_loss(gt, mask)`.
 - `burstISP/data/synthetic_burst_dataset.py` — `outliers` + `flow_mask`.
 - `analysis/kgts_sanity.py` — role side information in the scan stage, tuple-safe hook, aux
-  loss in the overfit stage. `budget_check.py` — `M2` preset, new parts.
+  loss in the overfit stage. `budget_check.py` — `--config` / `--budget` mode, total =
+  the counter's global count (the old per-part sum missed `KGTS.precompute`), presets
+  `M1-wide` (= the config) and `M1-wide-236dbba`.
+- `main/mamba_job.sh` — KGTSMamba pre-flight refuses configs over `MAX_GMACS=90`.
 - `analysis/kgts_cpu_checks.py` (new) — the CPU checks below, re-runnable anywhere:
   `python analysis/kgts_cpu_checks.py [--rev 236dbba] [--images <dir of natural images>]`.
-- `main/configs/M2_KGTSMamba.yml`, `main/configs/M2_KGTSMamba_RealBSR.yml`.
+- `main/configs/M1_KGTSMamba.yml` (every flag on), `main/configs/M1_KGTSMamba_RealBSR.yml`
+  (new: the real-data variant).
 
 Checks run (CPU): flags-off bit-exact vs HEAD on two configurations (packed/affine/M1
 token+scan settings; bayer/dt_norm/target), each also with W_c / γ / W_q perturbed (this

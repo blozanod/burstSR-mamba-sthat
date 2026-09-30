@@ -1,7 +1,7 @@
-# M2_KGTSMamba_RealBSR — M2 for real bursts (RealBSR-RAW). UNTESTED on data:
+# M1_KGTSMamba_RealBSR — M1 for real bursts (RealBSR-RAW). UNTESTED on data:
 # every option was exercised on CPU (docs/KGTS_ADVERSARIAL_REVIEW.md), none on RealBSR.
 #
-# What changes from M2_KGTSMamba.yml, and why:
+# What changes from M1_KGTSMamba.yml, and why:
 #   align.local        real bursts have moving objects and parallax; the global
 #                      affine model is wrong there. The hybrid hands coherently
 #                      disagreeing regions back to FlowAlign's dense flow.
@@ -9,12 +9,12 @@
 #                      photometric loss (keyframe vs each frame warped by the lv1
 #                      flow, blurred channel mean, + smoothness) replaces flow_opt
 #                      and keeps FlowAlign's heads trained (and used, for DDP).
-#   pretrain           start from an M2 run on SyntheticBurst trained WITH
+#   pretrain           start from an M1 run on SyntheticBurst trained WITH
 #                      datasets.train.outliers on, so the consistency selectors
 #                      have learned to reject taps before they meet real motion.
 #   compand: true      the RealBSR recipe (config.yml); psnr_srgb metrics.
 #   burst_aug          frame subsets from 4 frames up (real bursts vary in length).
-name: M2_KGTSMamba_RealBSR
+name: M1_KGTSMamba_RealBSR
 model_type: MambaFusionModel
 scale: 8
 num_gpu: 4
@@ -111,7 +111,7 @@ network_g:
     untie_out: true
 
 path:
-  # an M2_KGTSMamba checkpoint trained with datasets.train.outliers on (same arch)
+  # an M1_KGTSMamba checkpoint trained with datasets.train.outliers on (same arch)
   pretrain_network_g: ~
   strict_load_g: true
   resume_state: ~

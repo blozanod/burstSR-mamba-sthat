@@ -1,28 +1,55 @@
-# M1_KGTSMamba — MambaIRv2 on the keyframe + one tied KGTS after every ASSB.
+# M1_KGTSMamba — MambaIRv2 on the keyframe + one tied KGTS per injection point.
 #
 # Arch: burstISP/archs/KGTSMamba/kgts_mamba_arch.py. Compute goes to single-
 # image SR on the packed keyframe (the M0 trunk); the other 13 frames are
 # reached only through KGTS, a recurrent (weight-tied) keyframe-gated scan over
-# flow-indexed taps, called n_inject = len(depths) times.
+# flow-indexed taps, called n_inject = len(depths) + inject_first = 7 times.
 #
 # Body = budget_check.py's 'table-M1' (E=180, [4]*6, d_state 64). NOTE this is
 # not M0's body ([6]*4, inner_rank 32, num_tokens 64), so M1 - M0 is not a pure
-# "burst on/off" delta. For that, run this file with M0's body values.
+# "burst on/off" delta. For that, run this file with M0's body values (which
+# would also let the body warm-start from M0: docs/KGTS_ADVERSARIAL_REVIEW.md §5.3).
 #
-# Budget = budget_check.py's 'M1-wide', measured on GPU at (1, 14, 4, 48, 48)
-# BEFORE the KGTS corrections (a_max / affinity / dt_norm, token pos_freqs /
-# norm / mark_ref): 19.09M params, 73.4 GMACs, 0.82 GB eval peak. align 4.06
-# GMACs / 0.172M, kgts 12.64 GMACs / 0.260M (256 pooled dims per injection),
-# layers 47.74 / 17.80M. With them: 19.12M params (kgts 0.292M, bank 0.010M,
-# counted on CPU) and ~75.0 GMACs (+1.6 analytic, mostly the cached W_k x);
-# re-measure GMACs and peak with budget_check.py. The alignment corrections
-# (train.flow_target + token.tap_pos, align.global_motion) add no parameters
-# and ~0 GMACs; KGTS no longer pins each call's whole (P, 2*d_inner, 56) scan
-# output for backward (~1.5 GB of training activations at batch 4).
-# Run analysis/kgts_sanity.py before the first full launch.
+# Burst branch = the corrected KGTS (a_max / affinity / tokens' pos_freqs / norm /
+# mark_ref / pin_ref, one flow convention, exact tap positions) plus every change
+# of docs/KGTS_ADVERSARIAL_REVIEW.md (2026-09-30). All are flags, off by default
+# in the code; with them off the model is 236dbba's M1 bit for bit
+# (analysis/kgts_cpu_checks.py). Per change, one line (numbers: CPU, reduced
+# width, see the review):
+#   align.global_motion: lk   taps positioned by a photometric affine registration of
+#                             the burst itself: 0.079 vs ~0.35 packed px error, from step 0
+#   align.token_blocks: 2     per-frame tokens get 2 residual blocks (RF 11 -> 23 px)
+#   refine.at: [2]            tokens re-expressed in the keyframe state after call 2;
+#                             calls 3..6 pool values that deepened with the body
+#   kgts.roles                4 integrators + 2 geometric + 2 consistency selectors;
+#                             selectors scan in relevance order (frame-order invariant)
+#   kgts.out_norm: group      each head normalised on its own before W_c mixes them
+#   kgts.depth_embed/untie_out  the tied KGTS knows which depth it serves, and each depth
+#                             writes its own subspace (the stream grows 2.3x across calls)
+#   inject_first              the first ASSB already sees the burst
+#   aux_head + train.aux_opt  the burst branch gets gradient from step 0 (W_c is zero-init)
+#   train.*.unit: iter        schedules in optimizer iterations (were micro-steps: the
+#                             flow curriculum ran 2x fast)
+#   train.burst_aug           random frame subsets / orders: the burst is a set
+#   train.ema_decay           weight EMA for validation / release
+#
+# Budget at (1, 14, 4, 48, 48), counted like budget_check.py on GPU (FlopCounter
+# + analytic selective scans), on CPU: 88.0 GMACs (+0.1 aux head, training only),
+# 19.92M params. The same count gives 78.1 GMACs for 236dbba's M1 -- its header
+# said ~75.0 because budget_check summed per-module counts and KGTS.precompute's
+# token-side Linears (4.2 GMACs; 8.5 here with the refined second cache) run
+# outside kgts.forward; budget_check now reports the global total. mamba_job.sh
+# refuses to train over 90 GMACs. Adds vs 236dbba: +2.2 inject_first call, +6.4
+# refine (TokenRefine 2.2 + second token cache 4.2), +1.3 token_blocks, +0.1 LK.
+# Memory (CPU estimate, bytes saved for backward, bf16): 3.64 GiB per sample vs
+# 2.77 for 236dbba's M1 -> ~14.6 GiB at batch 4 (0.39 GiB per sample with
+# use_checkpoint). The pre-flight (analysis/kgts_sanity.py, run by mamba_job.sh)
+# measures the real GPU peak and stops the job if batch 4 OOMs; the fallback is
+# use_checkpoint: true, then batch 2 x accumulation 4.
 #
 # Recipe matches M0/L6 (AdamW 1e-4 cosine, warmup 2k, effective batch 32, L1
-# on linear RGB) plus L6's flow curriculum, held at a floor (see flow_lambda).
+# on linear RGB) plus L6's flow curriculum, held at a floor (see flow_lambda),
+# the burst-only auxiliary loss, burst augmentation and EMA.
 name: M1_KGTSMamba
 model_type: MambaFusionModel   # burst lq, bf16 autocast, flow curriculum via return_aux
 scale: 8
@@ -39,13 +66,19 @@ datasets:
     num_frames: 14
     phase: train
     scale: 8
-    # 4 x 4 GPUs x accumulation_steps 2 = 32. UNVERIFIED on A10: M0's trunk fit
-    # at 8, but KGTS holds (B*48*48, 2*d_inner, 56) scan inputs per injection.
-    # If it OOMs, set network_g.use_checkpoint: true first, then batch 2 x acc 4.
+    # 4 x 4 GPUs x accumulation_steps 2 = 32. UNVERIFIED on A10 (see the memory
+    # note above). If it OOMs, set network_g.use_checkpoint: true first, then
+    # batch 2 x acc 4.
     batch_size_per_gpu: 4
     num_worker_per_gpu: 6
     dataset_enlarge_ratio: 1
     grad_clip_norm: 1   # MambaFusionModel reads it here, not from train:
+    # Moving-object outliers: off for the benchmark run (SyntheticBurstVal has none,
+    # so they would only cost signal there). Turn on for a run that pretrains a
+    # real-data model (M1_KGTSMamba_RealBSR.yml): SyntheticBurst moves each frame by
+    # one affine map, so without them nothing ever rewards the consistency
+    # selectors for rejecting a tap.
+    # outliers: {prob: 0.3, max_frames: 3, size: 0.33, shift: [2, 6]}
 
   val:
     name: SyntheticBurst_val
@@ -65,7 +98,7 @@ network_g:
   out_chans: 3           # linear RGB
   embed_dim: 180         # also KGTS's ds
   d_state: 64
-  depths: [4, 4, 4, 4, 4, 4]   # len(depths) = number of KGTS injections
+  depths: [4, 4, 4, 4, 4, 4]   # len(depths) (+ inject_first) = number of KGTS injections
   num_heads: [6, 6, 6, 6, 6, 6]
   window_size: 16
   inner_rank: 64
@@ -77,7 +110,14 @@ network_g:
   upsampler: 'pixelshuffle'    # or 'pixelshuffledirect' (ignores upsample_feat)
   upsample_feat: 64
   resi_connection: '1conv'
-  use_checkpoint: false  # grad-checkpoint every ASSB and KGTS call
+  use_checkpoint: false  # grad-checkpoint every ASSB, KGTS call and token refinement
+
+  # ---- Burst-branch wiring ----
+  inject_first: true     # a 7th tied KGTS call on the embedded keyframe, before the first ASSB (call 0)
+  refine:
+    at: [2]              # after calls 0..2 (pre-body, ASSB 1, ASSB 2): calls 3..6 read the refined bank
+    hidden: 128
+  aux_head: true         # burst-only reconstruction from call 0; needs train.aux_opt
 
   # ---- Alignment front-end (KGTSAlign) ----
   align:
@@ -95,14 +135,17 @@ network_g:
     r: 2
     num_frames: 14       # informational only; FlowAlign is frame-count agnostic
     ref_idx: ~           # ~ -> N // 2. Also picks the keyframe.
-    # Hand the tokens a robust per-frame affine fit of the packed flow instead of the
-    # dense estimate (the flow loss still sees the dense pyramid). SyntheticBurst moves
-    # every frame by exactly one affine map, so the dense estimate's local error is pure
-    # noise -- and each tap's sub-pixel position is read off this flow with nothing
-    # downstream to correct it. CPU probe (real TokenBank + KGTS, small conv body, same
-    # frozen FlowAlign, 400 iters): burst gain +0.006 dB dense, +0.019 fitted, +0.041
-    # with the generator's own flow. ~ for real bursts with local motion (RealBSR).
-    global_motion: affine
+    # Tap positions from a robust photometric affine registration of each frame to the
+    # keyframe (affine_lk: Gauss-Newton, Tukey/MAD, blur schedule), started from zero
+    # motion and from the affine fit of FlowAlign's dense flow; the lower-cost start wins
+    # per frame. 0.079 packed px mean error on DBSR bursts at 32x32 (0.044 at 48x48) vs
+    # ~0.35 for the fit alone ('affine', the previous setting), and right from step 0,
+    # when the learned flow is ~5 px off. Detached: FlowAlign's heads train from the
+    # flow loss, which is why flow_lambda keeps a floor below. For real bursts with
+    # local motion add `local` (see M1_KGTSMamba_RealBSR.yml).
+    global_motion: lk
+    gm_margin: 4
+    token_blocks: 2      # residual depthwise 7x7 + MLP blocks per frame, zero-init
 
   # ---- TokenBank ----
   token:
@@ -130,18 +173,28 @@ network_g:
     n: 16                # state / key-query size per channel
     expand: 2            # d_inner = expand * d scan channels (pooled dims per direction)
     heads: 8             # independent key spaces for tap admission; d_inner % heads == 0
+    # Head jobs. At init every head was the same integrator (40-47 of 56 taps each),
+    # and a faster A alone only made a head recency-biased. int: accumulate every
+    # tap in frame order (a_max). geo / con: selectors scanned in ascending order of
+    # sample distance to the pixel's HR block / consistency with the keyframe, so a
+    # fast state keeps a soft top-k, a slow one reads every tap, and the scan is
+    # exactly invariant to frame order (a_max_sel); they skip the keyframe's own
+    # taps, and their backward copy reads the least relevant taps.
+    roles: [int, int, int, int, geo, geo, con, con]
+    a_max_sel: 8
     norm_s: true         # LayerNorm the keyframe state before it conditions anything
     out_gate: true       # keyframe-conditioned silu gate on pooled states
-    out_norm: true       # LayerNorm pooled states (were ~1e-3 RMS at init before token.norm; ~1 now)
+    out_norm: group      # one LayerNorm per (direction, head): integrators and selectors on equal footing
     dt_min: 0.01
     dt_max: 0.1
-    # Decay spectrum A_i = -a_max * i / n. Only the scan's LAST state is injected, so
-    # tap t is weighted by exp(A * sum of later dt): with the original S4D-real A =
-    # -(1..16) (a_max: 16) the scan read ~3 of the 14 frames at init -- 81% of the fwd
-    # sensitivity on frame 13, 80% of the bwd on frame 0. This config reads 12.8 of 14.
+    # Decay spectrum of the integrators, A_i = -a_max * i / n. Only the scan's LAST state
+    # is injected, so tap t is weighted by exp(A * sum of later dt): with the original
+    # S4D-real A = -(1..16) (a_max: 16) the scan read ~3 of the 14 frames at init.
     a_max: 0.5
-    affinity: true       # keyframe-token <q(s), k(x_t)> in dt: the keyframe can now CHOOSE taps
+    affinity: true       # keyframe-token <q(s), k(x_t)> in dt: the keyframe can CHOOSE taps
     dt_norm: false       # normalise dt over the taps (sum 1): bounds the decay whatever dt learns
+    depth_embed: true    # zero-init embedding of the call index on the normalised keyframe state
+    untie_out: true      # calls 1..6 get their own W_c (zero-init) and W_g (+0.67M params)
 
 # Training
 path:
@@ -155,6 +208,7 @@ train:
   total_iter: 300000
   warmup_iter: 2000
   compand: false         # plain L1 on linear RGB
+  ema_decay: 0.999       # validation and saved params_ema use the averaged weights
 
   optim_g:
     type: AdamW
@@ -176,25 +230,18 @@ train:
   # FlowAlign supervision against the generator's flow_vectors (L6 recipe).
   # KGTSMamba returns FlowAlign's own pyramid; MambaFusionModel.flow_loss
   # rescales GT to each level from the shapes, so both align types work.
-  # Matters more here than in L6: W_c is zero-init, so KGTS sends no gradient
-  # into the alignment until it starts injecting.
-  # Unlike L6 it does not decay to 0. KGTS gathers taps at integer positions
-  # and hands the scan their sub-pixel offset from the flow target as
-  # geometry, so that offset only means what the position encoding learned
-  # while the flow stays geometrically right -- and nothing downstream can
-  # refine it (L6's DCN could). Past the curriculum the SR loss would reach
-  # the flow only through that offset's encoding. The floor also keeps
-  # l_flow in the training log for the whole run.
+  # It never decays to 0: with global_motion lk the tokens' flow is detached, so
+  # this loss is what trains FlowAlign's flow heads (their fit seeds LK), and it
+  # keeps them in the graph for DDP (find_unused_parameters: false). The floor
+  # also keeps l_flow in the training log for the whole run.
   flow_opt:
     type: CharbonnierLoss
     loss_weight: 1.0
     reduction: mean
   flow_lambda:
-    # NOTE these milestones are read in MICRO-steps (optimize_parameters gets train.py's
-    # micro_step): with accumulation_steps 2 they land at optimizer iterations 15k / 30k.
-    # `unit: iter` reads them as iterations (M2 does); left unset here so M1 is unchanged.
     milestones: [0, 30000, 60000]
     values: [0.5, 0.1, 0.05]
+    unit: iter           # optimizer iterations (without it these land at 15k / 30k: micro-steps)
   flow_levels: [lv1, lv2, lv3]
   # flow_vectors is a FORWARD field (frame i's pixel j shows what the reference shows
   # at j + f(j)); FlowAlign refines by warping frame i to p - flow(p), which makes its
@@ -202,6 +249,25 @@ train:
   # and trained on the forward one FlowAlign still landed 65% of the way to the
   # backward one (CPU probe). Supervise the field it computes; token.tap_pos matches.
   flow_target: backward
+
+  # Burst-only reconstruction from the first KGTS call's pooled states (aux_head).
+  # Strong while the flow and tokens form, then a floor: at weight 0 its parameters
+  # would get no gradient and DDP (find_unused_parameters: false) would fail.
+  aux_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+  aux_lambda:
+    milestones: [0, 20000]
+    values: [1.0, 0.1]
+    unit: iter
+
+  # The burst is a set: shuffle the non-key frames every batch, and on 20% of
+  # batches keep a random subset of >= 8 frames (robustness to burst length).
+  burst_aug:
+    prob: 0.2
+    min_frames: 8
+    shuffle: true
 
 # Validation
 val:

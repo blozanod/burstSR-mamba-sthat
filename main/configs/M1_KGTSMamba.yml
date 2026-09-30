@@ -32,6 +32,8 @@
 #                             flow curriculum ran 2x fast)
 #   train.burst_aug           random frame subsets / orders: the burst is a set
 #   train.ema_decay           weight EMA for validation / release
+#   kgts.fused                KGTS end states from a Triton kernel instead of the Mamba scan
+#                             (speed only: same math, checked by kgts_sanity's scan stage)
 #
 # Budget at (1, 14, 4, 48, 48), counted like budget_check.py on GPU (FlopCounter
 # + analytic selective scans), on CPU: 88.0 GMACs (+0.1 aux head, training only),
@@ -195,6 +197,10 @@ network_g:
     dt_norm: false       # normalise dt over the taps (sum 1): bounds the decay whatever dt learns
     depth_embed: true    # zero-init embedding of the call index on the normalised keyframe state
     untie_out: true      # calls 1..6 get their own W_c (zero-init) and W_g (+0.67M params)
+    # Both end states from one Triton kernel (kgts_fused) instead of selective_scan_fn: same
+    # math, no parameters. The scan kernel ran 2.4M length-56 sequences per call and was ~45%
+    # of a training step (profile at batch 4: 1.78 s/step, 0.79 s of it KGTS scans).
+    fused: true
 
 # Training
 path:

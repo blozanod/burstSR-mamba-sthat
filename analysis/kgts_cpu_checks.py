@@ -10,7 +10,9 @@
              zero-init ones (depth_embed, untie_out, inject_first, refine, aux_head) are exact
              identities at init.
 3. roles     an all-selector KGTS is exactly invariant to the order of the non-key frames.
-4. geometry  (needs --images: a folder of natural images, e.g. Zurich's train/canon) affine_lk
+4. fused     kgts.fused (the Triton end-state kernels, run by Triton's CPU interpreter) against
+             the scan path: pooled states, KGTS output and every gradient. Skipped without triton.
+5. geometry  (needs --images: a folder of natural images, e.g. Zurich's train/canon) affine_lk
              against the DBSR generator's own geometry on synthetic bursts; local_residual
              follows a moving patch and leaves the rest on the global model.
 
@@ -31,6 +33,8 @@ from einops import rearrange, repeat
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, REPO)
+# kgts_fused's Triton kernels run on CPU tensors through the interpreter (must be set before triton.jit)
+os.environ.setdefault('TRITON_INTERPRET', '1')
 
 
 def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
@@ -86,6 +90,7 @@ def install_stubs():
 
 install_stubs()
 from burstISP.archs.KGTSMamba import flow_align_arch as fa  # noqa: E402
+from burstISP.archs.KGTSMamba import kgts_fused  # noqa: E402
 from burstISP.archs.KGTSMamba.kgts_arch import KGTS, TokenBank, TokenRefine  # noqa: E402
 from burstISP.archs.KGTSMamba.kgts_mamba_arch import KGTSMamba  # noqa: E402
 
@@ -216,6 +221,41 @@ def stage_roles():
             print(f'  (frame-order heads for comparison: relative change {rel:.1%})')
 
 
+def stage_fused():
+    print('[fused] Triton end-state kernels (CPU interpreter) vs the scan path')
+    if kgts_fused.triton is None:
+        print('  SKIPPED: triton is not importable'); return
+    for name, P, L, kg in (('roles + affinity, 8 heads (M1 shape)', 13, 8,
+                            dict(d=16, n=16, expand=2, heads=8, out_norm='group', a_max_sel=8.0,
+                                 roles=['int'] * 4 + ['geo'] * 2 + ['con'] * 2)),
+                           ('no roles, no affinity, padded widths', 11, 8,
+                            dict(d=12, n=6, expand=2, heads=4, affinity=False))):
+        torch.manual_seed(0)
+        d = kg.pop('d')
+        ks = [KGTS(24, d, n_calls=2, depth_embed=True, untie_out=True, fused=f, **kg) for f in (False, True)]
+        for p in [ks[0].W_c.weight, ks[0].gamma.weight, ks[0].beta.weight, ks[0].W_cs[0].weight] + \
+                 ([ks[0].W_q.weight] if ks[0].W_q is not None else []):
+            torch.nn.init.normal_(p, std=0.2)
+        ks[1].load_state_dict(ks[0].state_dict())
+        ks[1].use_fused = lambda t: True                 # the kernels, on CPU tensors
+        x, s = torch.randn(P, L, d), torch.randn(P, 24) * 3
+        valid = torch.rand(P, L) > 0.2
+        ex = {'pos': torch.rand(P, L, 2) * 2 - 0.5, 'cons': -torch.rand(P, L), 'is_ref': torch.arange(L) // 4 == 1}
+        res = []
+        for k in ks:
+            xs, ss = x.clone().requires_grad_(), s.clone().requires_grad_()
+            cache = k.precompute(xs, valid, ex)
+            y, out = k.pooled(k.norm_s(ss), cache), k(ss, cache, 1)
+            (out.pow(2).mean() + y.pow(2).mean()).backward()
+            res.append((y.detach(), out.detach(), {'x': xs.grad, 's': ss.grad,
+                        **{n: p.grad for n, p in k.named_parameters() if p.grad is not None}}))
+        rel = lambda a, b: ((a - b).norm() / b.norm().clamp_min(1e-12)).item()
+        (y0, o0, g0), (y1, o1, g1) = res
+        worst = max((rel(g1[n], g0[n]), n) for n in g0)
+        check(name, rel(y1, y0) < 1e-5 and rel(o1, o0) < 1e-5 and worst[0] < 1e-4 and set(g0) == set(g1),
+              f'pooled {rel(y1, y0):.1e}  out {rel(o1, o0):.1e}  worst grad {worst[0]:.1e} ({worst[1]})')
+
+
 def stage_geometry(images, n=30):
     print(f'[geometry] affine_lk vs the DBSR generator ({n} bursts from {images})')
     import random
@@ -270,6 +310,8 @@ def main():
         stage_options()
     if 'roles' not in skip:
         stage_roles()
+    if 'fused' not in skip:
+        stage_fused()
     if 'geometry' not in skip and args.images:
         stage_geometry(args.images)
     print('ALL PASS' if OK[0] else 'SOME CHECKS FAILED')

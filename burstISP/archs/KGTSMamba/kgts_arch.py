@@ -9,6 +9,7 @@ try:
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 except ImportError:
     selective_scan_fn = None
+from . import kgts_fused
 
 def tap_gather(feat, flow, k=2, tap_pos='target'):
     """
@@ -403,6 +404,14 @@ class KGTS(nn.Module):
         which call it is serving); untie_out gives every call its own W_c (zero-init)
         and W_g, so each depth writes into its own subspace of the residual stream.
         Token-side weights (and so the cache) stay shared.
+    fused: on CUDA, compute the two end states with kgts_fused (Triton) instead of
+        conditioned() + selective_scan_fn. Same math (fp32 inside, delta and B no longer
+        rounded to the token dtype); only the end state is computed, the per-call scan
+        inputs are built inside the kernel, and the backward direction reads the forward
+        tensors in reverse. The scan path ran P*2*d_inner length-L sequences through a
+        kernel built for a few long ones (~45% of an M1 training step). The cache is then
+        tap-major (P, L, *) with a per-head int8 valid mask. Not with dt_norm (that path
+        stays on the scan); on CPU the scan path is used, so the reference is unchanged.
 
     Both scan directions run as ONE selective_scan call: the backward copy is
     stacked on the channel axis (2*d_inner channels, 2*heads B-groups), as in
@@ -416,7 +425,7 @@ class KGTS(nn.Module):
 
     def __init__(self, ds, d=16, n=8, expand=1, heads=1, norm_s=True, out_gate=True, out_norm=True,
                  dt_min=1e-2, dt_max=1e-1, a_max=0.5, affinity=True, dt_norm=False,
-                 roles=None, a_max_sel=8.0, n_calls=1, depth_embed=False, untie_out=False):
+                 roles=None, a_max_sel=8.0, n_calls=1, depth_embed=False, untie_out=False, fused=False):
         super().__init__()
         di = expand * d
         if di % heads:
@@ -430,6 +439,7 @@ class KGTS(nn.Module):
         if out_norm not in (True, False, 'group'):
             raise ValueError(f"kgts.out_norm must be true, false or 'group', got {out_norm!r}")
         self.d, self.di, self.n, self.heads = d, di, n, heads
+        self.fused = fused
         self.roles, self.n_calls, self.untie_out = roles, n_calls, untie_out
 
         self.norm_s = nn.LayerNorm(ds) if norm_s else nn.Identity()
@@ -491,20 +501,39 @@ class KGTS(nn.Module):
         copy stacked on channels -- since it is the same tensor for every call.
         With roles, every per-tap tensor is put in its head's scan order here (the
         keys are token-side), and valid becomes per head, (P, L, heads).
+        With fused (on CUDA), everything stays tap-major (P, L, *) and valid is
+        (P, L, heads) int8 for every configuration: see kgts_fused.end_state.
         """
-        if self.roles is None:
+        if self.roles is None and not self.use_fused(x):
             # (this op order is the original's: autograd sums x's gradient in creation order)
             u = self.W_u(x).transpose(1, 2)                                # (P, di, L)
             u = torch.cat([u, u.flip(-1)], 1).contiguous()                 # (P, 2di, L)
             kx = self.W_k(x) if self.W_k is not None else None             # (P, L, heads*n)
             return u, self.W_delta(x), self.W_B(x), kx, valid.bool()
-        if extras is None:
+        if self.roles is not None and extras is None:
             raise ValueError('kgts.roles needs TokenBank side information (bank(..., extras=True))')
-        perm, valid = self.orders(valid.bool(), extras)
-        u = self.take(self.W_u(x), perm).transpose(1, 2)                   # (P, di, L), per-head order
+        if self.roles is None:
+            perm, valid = None, valid.bool().unsqueeze(-1).expand(-1, -1, self.heads)
+        else:
+            perm, valid = self.orders(valid.bool(), extras)
+        take = (lambda t: t) if perm is None else (lambda t: self.take(t, perm))
+        if self.use_fused(x):
+            c = lambda t: None if t is None else t.contiguous()
+            kx = take(self.W_k(x)) if self.W_k is not None else None
+            return (c(take(self.W_u(x))), c(take(self.W_delta(x))), c(take(self.W_B(x))), c(kx),
+                    valid.to(torch.int8).contiguous())
+        u = take(self.W_u(x)).transpose(1, 2)                              # (P, di, L), per-head order
         u = torch.cat([u, u.flip(-1)], 1).contiguous()                     # (P, 2di, L)
-        kx = self.take(self.W_k(x), perm) if self.W_k is not None else None
-        return u, self.take(self.W_delta(x), perm), self.take(self.W_B(x), perm), kx, valid
+        kx = take(self.W_k(x)) if self.W_k is not None else None
+        return u, take(self.W_delta(x)), take(self.W_B(x)), kx, valid
+
+    def use_fused(self, t):
+        """The Triton end-state path: kgts.fused, on CUDA, without dt_norm."""
+        if not (self.fused and t.is_cuda and not self.dt_norm):
+            return False
+        if kgts_fused.triton is None:
+            raise RuntimeError('kgts.fused is set but triton is not importable')
+        return True
 
     @torch.no_grad()
     def orders(self, valid, extras):
@@ -559,6 +588,12 @@ class KGTS(nn.Module):
 
     def pooled(self, sn, cache):
         """End states of both scans, (P, 2di) = [fwd; bwd], before out_norm. sn = norm_s(s)."""
+        if self.use_fused(sn):
+            u, dx, bx, kx, valid = cache
+            y = kgts_fused.end_state(dx, u, bx, kx, self.W_q(sn) if kx is not None else None, valid,
+                                     self.U_delta(sn), self.delta_bias, self.gamma(sn), self.beta(sn),
+                                     -torch.exp(self.A_log.float()), self.C)
+            return y.to(u.dtype)
         u, delta, B = self.conditioned(sn, cache)
         A = -torch.exp(self.A_log.float()).flatten(0, 1)                   # (2di, n)
         bias = None if self.dt_norm else self.delta_bias.float().repeat(2)  # dt_norm: delta is dt already

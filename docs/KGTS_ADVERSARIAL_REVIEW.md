@@ -24,7 +24,9 @@ differ by exactly this review.
    each tap's sub-pixel position straight off the flow, and nothing downstream corrects it.
    A parameter-free photometric affine registration of the burst itself (`align.global_motion:
    lk`) lands at **0.079 packed px** mean error from step 0, against ~0.35 for the affine
-   fit of the learned flow (and ~5 px for the learned flow at init).
+   fit of the learned flow (and ~5 px for the learned flow at init). In the fusion probe
+   (§8) the old geometry left the burst contributing +0.001 dB after 1000 iterations; `lk`
+   matched the oracle geometry (+0.368 vs +0.369 dB).
 2. **Your token-depth point is right, and it is broader than the convs:** the *entire value
    path* (`u = W_u x`, plus `W_δ x`, `W_B x`, `W_k x`) is computed once and is identical at all
    six injections. Deep calls can only re-weight the same shallow vectors. Two fixes:
@@ -36,7 +38,9 @@ differ by exactly this review.
    55% of its weight on the last 8 taps). The fix is to give selector heads an **order in
    which recency means relevance**: scan their taps sorted by a relevance key, so a fast state
    keeps a soft top-k, a slow state still reads every tap, and the scan becomes exactly
-   invariant to frame order (`kgts.roles`).
+   invariant to frame order (`kgts.roles`). Probe (§8): "tune A only" lost 0.14 dB of burst
+   gain and put 49–52% of its backward weight on corrupted frames (selection by frame
+   index); roles kept clean PSNR and halved the damage of moving-object frames.
 4. **The burst branch gets exactly zero gradient at step 0** (`W_c` is zero-init) and then a
    small one while `W_c` grows; an auxiliary burst-only reconstruction (`aux_head`) supervises
    it from step 0.
@@ -58,9 +62,10 @@ differ by exactly this review.
   `selective_scan_ref` (the MambaIRv2 body runs, slowly), and the KGTS end-state scan uses an
   exact closed form, `y_L = Σ_n C_n Σ_t exp(A_n τ_t) dt_t B_nt u_t` with `τ_t = Σ_{s>t} dt_s`,
   verified against `kgts_arch.ref_scan` (max abs error 5e-6 at scale 42, gradients 2e-7
-  relative). Training probes swap the six ASSBs for conv groups with the same call
-  signature, so everything else — alignment, bank, KGTS, wiring, upsampler — is the real
-  `KGTSMamba.forward`.
+  relative). Two training probes (§8): the full model with the ASSBs swapped for 3 conv
+  groups of the same call signature (everything else — alignment, bank, KGTS, wiring,
+  upsampler — the real `KGTSMamba.forward`), and a fusion-only model (the real alignment,
+  bank and KGTS decoded straight to HR) in which the burst has to carry the detail.
 - **Data.** 3000 training bursts (BSDS500 train+test) and 100 held-out bursts (BSDS500
   val = BSD100) through `rgb2rawburst` with the official transformation / noise parameters,
   keyframe at N // 2, flow_vectors kept.
@@ -81,13 +86,13 @@ differ by exactly this review.
 | 3 | Real data has no flow ground truth, so FlowAlign is unsupervised there | loss minimised at the true flow | `train.photo_opt` | implemented, tested |
 | 4 | Flow curriculum runs in micro-steps | code path | `flow_lambda.unit: iter` | implemented (opt-in) |
 | 5 | Shallow, static tokens: 5 convs (RF 11 px, ~77k params) for 13 frames vs a 24-layer body for 1 | code; value path identical at every call | `align.token_blocks` | implemented, probed |
-| 6 | Tokens never see what the body learned | code | `refine` (`TokenRefine` + cache rebuild) | implemented, probed |
+| 6 | Tokens never see what the body learned | code | `refine` (`TokenRefine` + cache rebuild) | implemented, identity at init |
 | 7 | Heads have no roles | init anatomy: all 16 are integrators | `kgts.roles` (int / geo / con) | implemented, measured, probed |
 | 8 | A fast decay in frame order is recency, not selection | a_max 8: up to 55% weight on the last 8 taps | relevance-ordered selector scans | implemented, exact invariance |
 | 9 | Heads share one LayerNorm | code | `kgts.out_norm: group` | implemented |
 | 10 | One tied KGTS serves six different depths; its update cannot grow with the residual stream | ‖s‖ grows 2.3× across the calls at init; the tied `W_c` writes the same size everywhere | `kgts.depth_embed`, `kgts.untie_out` | implemented, identity at init |
 | 11 | The first ASSB never sees the burst | code | `inject_first` | implemented, identity at init |
-| 12 | Zero gradient into the burst branch at step 0 | exact (W_c = 0) | `aux_head` + `train.aux_opt` | implemented, probed |
+| 12 | Zero gradient into the burst branch at step 0 | exact (W_c = 0) | `aux_head` + `train.aux_opt` | implemented, tested |
 | 13 | Synthetic training never rewards rejecting a tap | DBSR motion model | `datasets.train.outliers` (+ flow mask) | implemented, probed |
 | 14 | The burst is treated as an ordered, fixed-length sequence | scan is a recurrence; N fixed at 14 | `train.burst_aug` | implemented, tested |
 | 15 | No weight EMA | config | `train.ema_decay` in M1 | config |
@@ -313,19 +318,20 @@ keeps the scan and makes its one distinctive property, the decay spectrum, usefu
 
 ## 4. One tied KGTS serves six different depths
 
-- **Tied weights, untied representations.** `U_δ`, `W_q`, γ, β, `W_z`, `W_c` and `W_g` all read
-  `norm_s(s)`; `norm_s` fixes the *scale* of the residual stream across depths but not what
-  it represents — and it only fixes the input side. At M1 init the mean per-pixel ‖s‖
-  entering the six calls is 16.8, 19.4, 23.4, 27.4, 31.8, 38.1 (2.3× growth). The tied
-  `W_c` reads a normalised input, so it writes an update of the same size at every depth,
-  and the sigmoid gate can only shrink it: the deepest injection is structurally ≥ 2.3×
-  weaker *relative to the stream* than the first, whatever the loss wants (in the probe,
-  §8, the per-call injection ratio ‖Δs‖/‖s‖ was 2.2% / 0.9% / 0.35% across three calls). **`kgts.depth_embed`** adds a learned zero-init embedding of the call index
-  to the normalised state (every keyframe-side projection knows which depth it serves; 1.3k
-  params). **`kgts.untie_out`** gives calls 1… their own `W_c` (zero-init) and `W_g` (call 0
-  keeps the originals), so each depth writes into its own subspace (0.67M params at M1
-  width — the priciest item in M1's new flags; depth_embed alone is the cheap variant). Token-side
-  weights, and so the cache, stay shared.
+- **Tied weights, untied representations.** `U_δ`, `W_q`, γ, β, `W_z`, `W_c` and `W_g` all
+  read `norm_s(s)`; `norm_s` fixes the *scale* of the residual stream across depths but not
+  what it represents — and it only fixes the input side. At M1 init the mean per-pixel ‖s‖
+  entering the six calls is 16.8, 19.4, 23.4, 27.4, 31.8, 38.1 (2.3× growth). The tied `W_c`
+  reads a normalised input, so it writes an update of the same size at every depth, and the
+  sigmoid gate can only shrink it: the deepest injection is structurally ≥ 2.3× weaker
+  *relative to the stream* than the first, whatever the loss wants (in the full-model probe,
+  §8.1, the per-call injection ratio ‖Δs‖/‖s‖ at iteration 400 was 2.7% / 1.1% / 0.40%
+  across its three calls). **`kgts.depth_embed`** adds a learned zero-init embedding of the
+  call index to the normalised state (every keyframe-side projection knows which depth it
+  serves; 1.3k params). **`kgts.untie_out`** gives calls 1… their own `W_c` (zero-init) and
+  `W_g` (call 0 keeps the originals), so each depth writes into its own subspace (0.67M
+  params at M1 width — the priciest item in M1's new flags; depth_embed alone is the cheap
+  variant). Token-side weights, and so the cache, stay shared.
 - **The first ASSB never sees the burst.** Injections come after each ASSB; the first one
   (1/6 of the body) denoises and builds features from the single noisy keyframe.
   **`inject_first`** adds a call on the embedded keyframe before it (+1 call, ~2.2 GMACs).
@@ -395,8 +401,8 @@ hard-codes the assumption. The first moving object is met at test time.
 independently moving object the keyframe does not show). The GT is untouched, and a
 `flow_mask` removes those pixels from the flow loss (`MambaFusionModel.flow_loss(mask=…)`;
 a level's pixel counts only if its whole footprint is valid). On in M1 (30% of bursts): in
-the fusion probe it cost nothing on clean bursts and halved the damage of corrupted frames
-(§8).
+the fusion probe it cost nothing on clean bursts and cut the damage of corrupted frames by
+41–46% (§8).
 
 ### 6.2 The burst is a set of variable size (`train.burst_aug`)
 
@@ -445,34 +451,99 @@ LK-aligned frames) instead.
 
 ## 8. Probe results
 
-**Setup.** The real `KGTSMamba` wiring with the ASSBs swapped for 3 conv groups (2
-ResBlocks, 48 ch) → 3 KGTS calls; packed align (flow_feat 16), tokens c = d = 32 with M1's
-corrections, KGTS n 4 / expand 2 / 4 heads, x8 `pixelshuffledirect`; 0.49M params. The
-tokens get the generator's flow (oracle geometry — FlowAlign still trains on the flow loss),
-so fusion mechanisms are compared without flow noise. AdamW 4e-4, warmup 100, cosine to 5%
-over 600 iterations, batch 4 of 24×24 packed crops (3000 training bursts). Eval on 60
-held-out bursts at 32×32, 8 px border: burst gain = PSNR(real) − PSNR(every frame replaced
-by the keyframe); robustness = PSNR change when 3 / 6 non-key frames carry a moving-object
-box (a quarter of the frame, displaced 4–8 px); at the end, the PSNR lost by skipping each
-KGTS call. Arms share seed and data order.
+Two CPU probes on the same data (BSDS500 through the DBSR generator, §"How this was
+checked"). One seed, paired arms (same init seed and data order), a few hundred to a
+thousand iterations: directions, not benchmarks.
 
-**Caveat — read the paired columns, not absolute PSNR.** The same base configuration read
-24.84 dB at iteration 200 on 2 CPU threads and 25.40 dB on 4 (float reduction order changes
-the trajectory). Burst gain, the corruption drop and the per-call ablation are measured
-within one model and are the comparable numbers. One seed, 600 iterations, a 0.5M-param
-body: directions only.
+### 8.1 Full model, stopped at 400 iterations — too short to resolve anything
 
-**Status when this section was written: in progress.** Arms, all at the setup above:
-A0 base, A1 `roles` [int, int, geo, con] + `out_norm: group`, A2 `token_blocks: 2` +
-`refine.at: [0]`, A3 `inject_first` + `aux_head` + `depth_embed` + `untie_out`, R0 / R1 = A0 / A1
-trained with moving-object outliers in half the batches. A follow-up commit replaces this
-paragraph with the table. Readings so far (iteration 200 of 600, the branch just switching
-on — both gains are at the noise floor, nothing to conclude yet):
+The real `KGTSMamba` wiring with the ASSBs swapped for 3 conv groups (0.49M params, 3 KGTS
+calls, oracle tap geometry). At iteration 400 the burst gain was +0.006 dB (base) vs +0.013
+dB (roles), corrupted-frame drops ≤ 0.01 dB: the burst branch had barely switched on, and
+absolute PSNR at this scale is noise (the same base configuration read 24.84 dB at iteration
+200 on 2 CPU threads and 25.40 dB on 4). One thing did show: the per-call injection ratio
+‖Δs‖/‖s‖ fell ~7× from the first call to the third (2.7% / 1.1% / 0.40% at iteration 400,
+base; 3.3% / 1.3% / 0.47%, roles) — the depth imbalance of §4. Both runs were then killed by
+an out-of-memory event on the probe machine (a concurrent memory measurement of mine), so
+there is no final eval. The flags that need the deep body — `refine`, `inject_first`,
+`aux_head`, `depth_embed` / `untie_out` — are therefore not probed at the SR level; they are
+exact identities at init, and the case for them is the one made in §2, §4 and §5 (a static
+value path, a stream that grows 2.3× while the tied `W_c` cannot, exactly zero gradient into
+the burst branch at step 0).
 
-| arm | burst gain | Δ PSNR, 3 / 6 corrupted frames | \|W_c\| | ‖Δs‖/‖s‖ per call |
+### 8.2 Fusion only — the burst has to carry the detail
+
+The real `KGTSAlign` (packed, flow_feat 16), `TokenBank` (c = d = 32, M1's corrections)
+and `KGTS` (n 4, expand 2, 4 heads); **one** KGTS call conditioned on a tiny keyframe path
+(conv + 2 ResBlocks, 48 ch); a per-pixel linear decoder of [pooled states; keyframe state]
+→ 3 × 8 × 8 + pixel shuffle (the `aux_head`'s form). ~0.2M params, no deep body to fall back
+on, so fusion and geometry designs separate within 1000 iterations. Tap geometry is the
+generator's flow ("oracle") unless stated; FlowAlign still trains on the flow loss. AdamW
+5e-4, warmup 100, cosine over 1000 iterations, batch 4 of 24×24 packed crops. Eval on 60
+held-out bursts at 32×32, 8 px border: clean PSNR; PSNR with every frame replaced by the
+keyframe (burst gain = the difference); PSNR change when 3 / 6 non-key frames carry a
+moving-object box (a quarter of the frame, displaced 4–8 px); mean |ΔPSNR| when the non-key
+frames are shuffled.
+
+| arm | tap geometry | clean PSNR | all-keyframe | burst gain | 3 / 6 corrupted frames | \|Δ\| under frame shuffle |
+|---|---|---|---|---|---|---|
+| base: 4 integrator heads | oracle | 28.470 | 28.101 | +0.369 | −0.068 / −0.260 | 0.0074 |
+| "tune A only": heads 2, 3 at a_max 8, frame order | oracle | 28.433 | 28.207 | +0.226 | −0.056 / −0.218 | 0.0081 |
+| roles [int, int, geo, con] + out_norm group | oracle | 28.491 | 28.234 | +0.258 | −0.037 / −0.123 | 0.0023 |
+| base + `align.token_blocks: 2` | oracle | 28.494 | 28.290 | +0.203 | −0.031 / −0.127 | 0.0026 |
+| base, outliers in 50% of batches | oracle | 28.463 | 28.200 | +0.263 | −0.038 / −0.154 | 0.0058 |
+| roles, outliers in 50% of batches | oracle | 28.493 | 28.285 | +0.208 | −0.020 / −0.067 | 0.0025 |
+| base | learned flow + affine fit (M1 before) | 28.330 | 28.329 | +0.001 | −0.002 / −0.007 | 0.0031 |
+| base | `lk` (M1 now) | 28.484 | 28.116 | +0.368 | −0.066 / −0.235 | 0.0079 |
+
+Clean PSNR is the top-line number. Burst gain is secondary: its all-keyframe reference moves
+with the design too (selectors and deeper tokens make better use of 13 copies of the
+keyframe), so a lower gain next to an equal or higher clean PSNR is not a loss.
+
+- **Geometry is the lever.** With M1's previous geometry (learned flow → affine fit) the
+  burst contributed **+0.001 dB** after 1000 iterations — the taps sat at the wrong positions
+  and the model learned to ignore them (clean 28.330; at iteration 250 the gain was already
+  −0.029 vs +0.190 with `lk`). The parameter-free `lk` registration **matches the oracle**:
+  28.484 vs 28.470 clean, +0.368 vs +0.369 gain.
+- **"Tune A only" loses** (clean −0.04, gain −0.14 vs base): fast decay in frame order.
+- **Roles keep clean quality and halve the damage of moving objects**: 28.491 vs 28.470
+  clean; −0.037 / −0.123 vs −0.068 / −0.260 with 3 / 6 corrupted frames; 3× less sensitive to
+  frame order.
+- **Deeper tokens learn faster and are more robust**: ahead of base throughout (28.124 vs
+  27.986 at iteration 500, 28.402 vs 28.328 at 750, 28.494 vs 28.470 at 1000), corrupted-frame
+  damage −0.127 vs −0.260.
+- **Outlier training is free on clean bursts** (28.463 vs 28.470 base, 28.493 vs 28.491
+  roles) and cuts the damage again: −0.154 (base), −0.067 (roles, a quarter of base's).
+
+### 8.3 What the heads learned
+
+On the trained arms: bursts with a moving-object box in frames 0, 4 and 10; pixels inside
+the box; per head × direction, the share of the end state's |per-tap weight| on the
+corrupted frames' taps (uniform over the 13 non-key frames: 23%) and the effective number
+of non-key taps read (participation ratio, of 52). Weights are mapped back to frame order
+through each head's scan order.
+
+| arm | integrators fwd / bwd | fast-A heads fwd / bwd | geo fwd / bwd | con fwd / bwd |
 |---|---|---|---|---|
-| A0 base | +0.002 | −0.000 / −0.001 | 0.220 | 2.1% / 0.9% / 0.3% |
-| A1 roles | +0.002 | −0.000 / −0.001 | 0.273 | 2.4% / 0.9% / 0.4% |
+| base | 21–22% / 25–26% (41–48 taps) | | | |
+| base + outliers | 21–22% / 25% (42–48 taps) | | | |
+| "tune A only" | 21% / 25% (44–47 taps) | **11–12% / 49–52%** (~21 taps) | | |
+| roles | 22% / 24–26% (46–49 taps) | | 23% / 24% (22–25 taps) | **19.6% / 29.2%** (43–46 taps) |
+| roles + outliers | 22% / 24–26% | | 23% / 24% | 19.4% / 29.0% |
+
+- The fast-A heads *look* selective going forward (11–12% on the corrupted frames) — but
+  their backward copies put **49–52%** on them, because frames 0 and 4 are the last ones
+  scanned in that direction. That is selection by frame index, and with the corruption in
+  other frames it would invert: the "it must consider all scans" failure, measured.
+- The consistency heads rank by content, so the effect does not depend on which frames
+  are corrupted: forward they read the consistent taps last (19.6%), backward the
+  inconsistent ones (29.2%) — the outlier readout the design intended. Geometric heads are
+  neutral to corruption, as they should be, and selective (~23 effective taps).
+- Integrator heads have no way to discriminate: even trained with outliers they stay at
+  21–26%, so base's robustness gain from outlier training (−0.260 → −0.154) comes from
+  elsewhere (admission via dt, the keyframe gate, the decoder). The heads' shares move
+  modestly at this scale (a shallow content key, 1000 iterations); the SR-level numbers in
+  §8.2 are the stronger evidence.
 
 ---
 
@@ -480,7 +551,8 @@ on — both gains are at the noise floor, nothing to conclude yet):
 
 `main/configs/M1_KGTSMamba.yml` carries every flag of this review (the queued M1 run
 starts with them), including `datasets.train.outliers` (30% of bursts): in the fusion
-probe (§8) it cost nothing on clean bursts and halved the damage of corrupted frames, and
+probe (§8) it cost nothing on clean bursts and cut the damage of corrupted frames by
+41–46%, and
 it is the only thing in synthetic training that rewards rejecting a tap. The same run is
 then the starting point for `main/configs/M1_KGTSMamba_RealBSR.yml`.
 

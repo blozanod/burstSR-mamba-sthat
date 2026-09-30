@@ -145,10 +145,14 @@ network_g:
     # ~0.35 for the fit alone ('affine', the previous setting), and right from step 0,
     # when the learned flow is ~5 px off. Detached: FlowAlign's heads train from the
     # flow loss, which is why flow_lambda keeps a floor below. For real bursts with
-    # local motion add `local` (see M1_KGTSMamba_RealBSR.yml).
+    # local motion add `local` (see M1_KGTSMamba_RealBSR.yml). Fusion probe (review §8):
+    # burst gain +0.368 dB with lk vs +0.001 with the fit, oracle geometry +0.369.
     global_motion: lk
     gm_margin: 4
-    token_blocks: 2      # residual depthwise 7x7 + MLP blocks per frame, zero-init
+    # residual depthwise 7x7 + MLP blocks per frame, zero-init. Fusion probe (review §8):
+    # ahead of the shallow tokens throughout (+0.14 dB at 500 iters, +0.02 at 1000),
+    # half the damage of moving-object frames
+    token_blocks: 2
 
   # ---- TokenBank ----
   token:
@@ -182,7 +186,10 @@ network_g:
     # sample distance to the pixel's HR block / consistency with the keyframe, so a
     # fast state keeps a soft top-k, a slow one reads every tap, and the scan is
     # exactly invariant to frame order (a_max_sel); they skip the keyframe's own
-    # taps, and their backward copy reads the least relevant taps.
+    # taps, and their backward copy reads the least relevant taps. Fusion probe (review
+    # §8): same clean PSNR as all-integrator heads, half the damage of moving-object
+    # frames, 3x less order-sensitive; "tune A only" (fast A in frame order) lost 0.14 dB of
+    # burst gain.
     roles: [int, int, int, int, geo, geo, con, con]
     a_max_sel: 8
     norm_s: true         # LayerNorm the keyframe state before it conditions anything

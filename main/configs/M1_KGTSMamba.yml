@@ -95,6 +95,14 @@ network_g:
     r: 2
     num_frames: 14       # informational only; FlowAlign is frame-count agnostic
     ref_idx: ~           # ~ -> N // 2. Also picks the keyframe.
+    # Hand the tokens a robust per-frame affine fit of the packed flow instead of the
+    # dense estimate (the flow loss still sees the dense pyramid). SyntheticBurst moves
+    # every frame by exactly one affine map, so the dense estimate's local error is pure
+    # noise -- and each tap's sub-pixel position is read off this flow with nothing
+    # downstream to correct it. CPU probe (real TokenBank + KGTS, small conv body, same
+    # frozen FlowAlign, 400 iters): burst gain +0.006 dB dense, +0.019 fitted, +0.041
+    # with the generator's own flow. ~ for real bursts with local motion (RealBSR).
+    global_motion: affine
 
   # ---- TokenBank ----
   token:

@@ -34,7 +34,7 @@ CONFIGS = {
     'M1-bayer':    dict(**M1_BODY, align=dict(type='bayer', flow_feat=48, flow_in_chans=48),
                         token=dict(c=64, d=64), kgts=dict(n=16, heads=4)),
     # main/configs/M1_KGTSMamba.yml
-    'M1-wide':     dict(**M1_BODY, align=dict(type='packed', flow_feat=32),
+    'M1-wide':     dict(**M1_BODY, align=dict(type='packed', flow_feat=32, global_motion='affine'),
                         token=dict(c=64, d=64), kgts=dict(n=16, heads=8, expand=2)),
     # M1-wide before the KGTS corrections, for the cost of the fixes
     'M1-wide-orig': dict(**M1_BODY, align=dict(type='packed', flow_feat=32, **ORIG_ALIGN),

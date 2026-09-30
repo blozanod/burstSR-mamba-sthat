@@ -20,26 +20,30 @@ def affine_flow_fit(flow, margin=4, iters=3, size=None):
     M, _, h, w = flow.shape
     hv, wv = size or (h, w)
     my, mx = min(margin, (hv - 1) // 2), min(margin, (wv - 1) // 2)
-    ys, xs = torch.meshgrid(torch.arange(h, device=flow.device, dtype=torch.float32),
-                            torch.arange(w, device=flow.device, dtype=torch.float32), indexing='ij')
-    # centred, unit-range coordinates keep the 3x3 normal equations well conditioned
-    X = torch.stack([xs / w - 0.5, ys / h - 0.5, torch.ones_like(xs)], -1).view(1, h * w, 3)
-    Y = flow.float().flatten(2).transpose(1, 2)                             # (M, hw, 2)
-    m = torch.zeros(h, w, device=flow.device)
-    m[my:hv - my, mx:wv - mx] = 1
-    w0 = m.view(1, h * w).expand(M, -1)
-    wt = w0
-    eye = 1e-6 * torch.eye(3, device=flow.device)
-    for it in range(iters + 1):
-        Xw = X * wt[..., None]
-        beta = torch.linalg.solve(Xw.transpose(1, 2) @ X + eye, Xw.transpose(1, 2) @ Y)   # (M, 3, 2)
-        if it == iters:
-            break
-        with torch.no_grad():
-            r = (Y - X @ beta).norm(dim=-1)                                  # (M, hw)
-            c = 2 * (r * w0).sum(1, keepdim=True) / w0.sum(1, keepdim=True)
-            wt = w0 / (1 + (r / c.clamp_min(1e-3)) ** 2)
-    return (X @ beta).transpose(1, 2).reshape(M, 2, h, w).to(flow.dtype)
+    # fp32 throughout: under bf16 autocast the matmuls would come out bf16 and linalg.solve
+    # refuses mixed dtypes (A is promoted back to fp32 by `eye`, B is not)
+    with torch.autocast(device_type=flow.device.type, enabled=False):
+        ys, xs = torch.meshgrid(torch.arange(h, device=flow.device, dtype=torch.float32),
+                                torch.arange(w, device=flow.device, dtype=torch.float32), indexing='ij')
+        # centred, unit-range coordinates keep the 3x3 normal equations well conditioned
+        X = torch.stack([xs / w - 0.5, ys / h - 0.5, torch.ones_like(xs)], -1).view(1, h * w, 3)
+        Y = flow.float().flatten(2).transpose(1, 2)                         # (M, hw, 2)
+        m = torch.zeros(h, w, device=flow.device)
+        m[my:hv - my, mx:wv - mx] = 1
+        w0 = m.view(1, h * w).expand(M, -1)
+        wt = w0
+        eye = 1e-6 * torch.eye(3, device=flow.device)
+        for it in range(iters + 1):
+            Xw = X * wt[..., None]
+            beta = torch.linalg.solve(Xw.transpose(1, 2) @ X + eye, Xw.transpose(1, 2) @ Y)   # (M, 3, 2)
+            if it == iters:
+                break
+            with torch.no_grad():
+                r = (Y - X @ beta).norm(dim=-1)                              # (M, hw)
+                c = 2 * (r * w0).sum(1, keepdim=True) / w0.sum(1, keepdim=True)
+                wt = w0 / (1 + (r / c.clamp_min(1e-3)) ** 2)
+        fit = (X @ beta).transpose(1, 2).reshape(M, 2, h, w)
+    return fit.to(flow.dtype)
 
 
 def gaussian_blur(x, sigma):

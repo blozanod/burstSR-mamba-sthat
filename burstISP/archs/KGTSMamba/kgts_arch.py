@@ -136,6 +136,12 @@ class TokenBank(nn.Module):
     Out:
     x: [P, L, d]
     valid: [P, L]
+    with extras=True also a dict of per-tap side information, for KGTS.roles:
+        pos: [P, L, 2] fp32, the tap's sample position relative to p (packed px)
+        cons: [P, L] fp32, -mean_c (content - keyframe content)^2: how well the tap's
+            content (before the position code) matches the mean of the keyframe's own
+            taps at p. Parameter-free, so it ranks taps meaningfully from step 0.
+        is_ref: [L] bool, the keyframe's own taps
     """
     def __init__(self, c, d, k=2, pos_freqs=(0.5, 1, 2, 4), norm=True, mark_ref=True, pin_ref=True,
                  tap_pos='backward'):
@@ -157,7 +163,7 @@ class TokenBank(nn.Module):
         a = 2 * math.pi * pos[..., None] * self.pos_freqs                  # (..., 2, F)
         return torch.cat([pos, a.sin().flatten(-2), a.cos().flatten(-2)], -1)
 
-    def forward(self, feats, flow, ref=None):
+    def forward(self, feats, flow, ref=None, extras=False):
         B, N, C, H, W = feats.shape
 
         feats = rearrange(feats, 'b n c h w -> (b n) c h w')
@@ -175,6 +181,7 @@ class TokenBank(nn.Module):
         pos = rearrange(pos, 'b n k c h w -> (b h w) (n k) c') # c = 2
         valid = rearrange(valid, 'b n k h w -> (b h w) (n k)')
 
+        side = self.side_info(x, pos, valid, ref) if extras else None
         pos = self.pos_encode(self.fourier(pos))
 
         x = x + pos
@@ -183,7 +190,56 @@ class TokenBank(nn.Module):
             x = x + is_ref.to(x.dtype)[:, None] * self.ref_embed.to(x.dtype)   # no fp32 promotion
         x = x * valid[..., None]
 
-        return x, valid
+        return (x, valid) if side is None else (x, valid, side)
+
+    @torch.no_grad()
+    def side_info(self, content, pos, valid, ref):
+        """See the class docstring (extras). content: gathered taps before the position code.
+        Only ever used as sort keys, so no autograd."""
+        if ref is None:
+            raise ValueError('TokenBank extras need the keyframe index')
+        is_ref = torch.arange(content.shape[1], device=content.device) // self.k ** 2 == ref
+        c = content.float()
+        vr = (valid & is_ref).float()[..., None]                           # the keyframe's valid taps
+        mean = (c * vr).sum(1, keepdim=True) / vr.sum(1, keepdim=True).clamp_min(1)
+        return {'pos': pos.detach().float(), 'cons': -(c - mean).pow(2).mean(-1), 'is_ref': is_ref}
+
+
+class TokenRefine(nn.Module):
+    """Keyframe-conditioned token update: x <- x + W2 gelu(W1 LN(x) + V LN(s)).
+
+    TokenBank's tokens come from a shallow per-frame encoder and are computed once,
+    while the keyframe state they are pooled into deepens through the body. A tap token
+    and the keyframe state at its pixel p sit on the same (reference) grid, so the whole
+    keyframe context at p -- the body's receptive field, not the encoder's -- can
+    re-express every tap of p without any warping. W2 is zero-init (identity at init).
+    Invalid taps stay 0. KGTS's token-side cache must be recomputed afterwards.
+    """
+    def __init__(self, d, ds, hidden=None):
+        super().__init__()
+        hidden = hidden or 2 * d
+        self.norm_x, self.norm_s = nn.LayerNorm(d), nn.LayerNorm(ds)
+        self.W1 = nn.Linear(d, hidden)
+        self.V = nn.Linear(ds, hidden, bias=False)
+        self.W2 = nn.Linear(hidden, d)
+        nn.init.zeros_(self.W2.weight); nn.init.zeros_(self.W2.bias)
+
+    def forward(self, x, valid, s):
+        """x: (P, L, d) tokens, valid: (P, L), s: (P, ds) keyframe state."""
+        h = self.W1(self.norm_x(x)) + self.V(self.norm_s(s)).unsqueeze(1)
+        return (x + self.W2(F.gelu(h))) * valid[..., None]
+
+
+class GroupLayerNorm(nn.Module):
+    """LayerNorm over each of `groups` equal slices of the last dim, then one affine over all of it."""
+    def __init__(self, groups, dim, eps=1e-5):
+        super().__init__()
+        self.groups, self.eps = groups, eps
+        self.weight, self.bias = nn.Parameter(torch.ones(dim)), nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        g = x.view(*x.shape[:-1], self.groups, -1)
+        return F.layer_norm(g, g.shape[-1:], eps=self.eps).view_as(x) * self.weight + self.bias
 
 def ref_scan(u, delta, A, B, C, delta_bias=None, delta_softplus=True):
     """Pure-torch selective scan (S6). Slow; this is the ground truth.
@@ -310,18 +366,71 @@ class KGTS(nn.Module):
         competitive -- the end state is a dt-weighted average over the taps
         instead of a sum, so its scale no longer depends on the dt level or on
         how many taps are valid. Invalid taps get dt = 0 exactly.
+    roles: None, or one role per head -- gives the heads different JOBS instead of
+        identical inits (measured at M1 init: all 16 head x direction pairs read
+        40-47 of the 56 taps with 15-22% of their weight on the last 8, i.e. they are
+        interchangeable integrators). A fast decay alone cannot make a head selective:
+        in frame order it only makes it recency-biased (a_max 8 puts up to 55% on
+        the last 8 taps and quadruples the change under a frame permutation). So a
+        selector head also gets an ORDER in which recency means relevance: its taps
+        are scanned in ascending order of a per-tap key, so a fast state keeps a
+        soft top-k of the key, a slow one still reads everything, and the scan
+        becomes exactly invariant to the order of the burst's frames.
+        'int' (integrate / inject): frame order, A spectrum from a_max -- the
+            accumulator the scan already was (denoising, gathering every sample).
+        'geo' (geometric selector): ascending -|sample pos - block centre|^2, so the
+            samples nearest the pixel's HR block come last -- a learned narrow
+            interpolation kernel over the whole burst.
+        'con' (consistency selector): ascending TokenBank's `cons`, the tap's match to
+            the keyframe's own content at p, so the most consistent taps come last --
+            robust fusion that can reject occluded / misaligned / moving content.
+        Selectors use a_max_sel (fast states = top few taps, slow = top dozens) and
+        never read the keyframe's own taps (the body has them; ranked by consistency
+        they would trivially win). The backward copy of a selector scans the reverse
+        order, so its fast states summarise the LEAST relevant taps (an outlier
+        readout). Orders are fixed per forward (keys are token-side, cached); the
+        keyframe still re-weights taps per call through dt and the affinity.
+        Needs TokenBank(extras=True) side information; costs one gather per cached
+        tensor per forward, nothing per call.
+    a_max_sel: a_max of the selector heads' A spectrum.
+    out_norm: True (LayerNorm over all 2*d_inner pooled dims), False, or 'group':
+        one LayerNorm per (direction, head), so heads with different jobs (and
+        different state scales) are normalised separately before W_c mixes them.
+    n_calls, depth_embed, untie_out: the weights are tied across the n_calls
+        injection points although the keyframe state is a different representation
+        at each depth. depth_embed adds a learned zero-init embedding of the call
+        index to the normalised keyframe state (every keyframe-side projection sees
+        which call it is serving); untie_out gives every call its own W_c (zero-init)
+        and W_g, so each depth writes into its own subspace of the residual stream.
+        Token-side weights (and so the cache) stay shared.
 
     Both scan directions run as ONE selective_scan call: the backward copy is
     stacked on the channel axis (2*d_inner channels, 2*heads B-groups), as in
     VMamba's cross-scan.
     """
+    ROLES = ('int', 'geo', 'con')
+    # 'geo' key anchor, in tap-position units (0 = where the keyframe's R sample of p sits, HR 8p).
+    # The x8 HR block of p spans [p, p + 7/8], centre 7/16; a tap's RGGB quad spans [0, 1/2]
+    # from its R sample, centroid 1/4. Quad centroid on block centre: pos = 7/16 - 1/4.
+    ANCHOR = 3 / 16
+
     def __init__(self, ds, d=16, n=8, expand=1, heads=1, norm_s=True, out_gate=True, out_norm=True,
-                 dt_min=1e-2, dt_max=1e-1, a_max=0.5, affinity=True, dt_norm=False):
+                 dt_min=1e-2, dt_max=1e-1, a_max=0.5, affinity=True, dt_norm=False,
+                 roles=None, a_max_sel=8.0, n_calls=1, depth_embed=False, untie_out=False):
         super().__init__()
         di = expand * d
         if di % heads:
             raise ValueError(f'd_inner = expand*d = {di} must be divisible by heads = {heads}')
+        if roles is not None:
+            roles = list(roles)
+            if len(roles) != heads or any(r not in self.ROLES for r in roles):
+                raise ValueError(f'kgts.roles must list one of {self.ROLES} per head ({heads}), got {roles}')
+            if all(r == 'int' for r in roles):
+                roles = None                                               # nothing to reorder
+        if out_norm not in (True, False, 'group'):
+            raise ValueError(f"kgts.out_norm must be true, false or 'group', got {out_norm!r}")
         self.d, self.di, self.n, self.heads = d, di, n, heads
+        self.roles, self.n_calls, self.untie_out = roles, n_calls, untie_out
 
         self.norm_s = nn.LayerNorm(ds) if norm_s else nn.Identity()
 
@@ -349,12 +458,17 @@ class KGTS(nn.Module):
 
         # A = -exp(A_log) stays negative; S4D-real shape, scaled so the set of taps is
         # not read with a recency bias (see a_max). Index 0 = fwd, 1 = bwd.
-        A = (a_max / n) * torch.arange(1, n + 1, dtype=torch.float32).repeat(di, 1)   # (di, n)
+        if roles is None:
+            A = (a_max / n) * torch.arange(1, n + 1, dtype=torch.float32).repeat(di, 1)   # (di, n)
+        else:                                                              # per head: its role's spectrum
+            A = torch.cat([((a_max if r == 'int' else a_max_sel) / n)
+                           * torch.arange(1, n + 1, dtype=torch.float32).repeat(di // heads, 1) for r in roles])
         self.A_log = nn.Parameter(torch.log(A)[None].repeat(2, 1, 1))      # (2, di, n)
         self.C = nn.Parameter(torch.randn(2, di, n) / math.sqrt(n))        # fixed readout; s enters via gamma
 
         # unit-scale pooled states, then the keyframe-conditioned output gate
-        self.out_norm = nn.LayerNorm(2 * di) if out_norm else nn.Identity()
+        self.out_norm = (GroupLayerNorm(2 * heads, 2 * di) if out_norm == 'group' else
+                         nn.LayerNorm(2 * di) if out_norm else nn.Identity())
         self.W_z = nn.Linear(ds, 2 * di) if out_gate else None
 
         # injection: s <- s + g * W_c [y_fwd; y_bwd],  g = sigmoid(W_g [s; ds])
@@ -362,16 +476,57 @@ class KGTS(nn.Module):
         nn.init.zeros_(self.W_c.weight); nn.init.zeros_(self.W_c.bias)     # exact identity at init
         self.W_g = nn.Linear(2 * ds, ds)
 
-    def precompute(self, x, valid):
+        # per-call conditioning (built last: flags off leave the parameter RNG stream untouched)
+        self.depth_embed = nn.Parameter(torch.zeros(n_calls, ds)) if depth_embed else None
+        if untie_out:                        # call 0 keeps W_c / W_g, calls 1.. get their own
+            self.W_cs = nn.ModuleList(nn.Linear(2 * di, ds) for _ in range(n_calls - 1))
+            self.W_gs = nn.ModuleList(nn.Linear(2 * ds, ds) for _ in range(n_calls - 1))
+            for W in self.W_cs:
+                nn.init.zeros_(W.weight); nn.init.zeros_(W.bias)
+
+    def precompute(self, x, valid, extras=None):
         """Token-only terms, once per forward. Invalid taps get dt ~ 0: no decay AND no admission.
 
         u is built here in its final scan layout -- (P, 2*d_inner, L), backward
         copy stacked on channels -- since it is the same tensor for every call.
+        With roles, every per-tap tensor is put in its head's scan order here (the
+        keys are token-side), and valid becomes per head, (P, L, heads).
         """
-        u = self.W_u(x).transpose(1, 2)                                    # (P, di, L)
-        u = torch.cat([u, u.flip(-1)], 1).contiguous()                     # (P, 2di, L)
+        u = self.W_u(x)                                                    # (P, L, di)
         kx = self.W_k(x) if self.W_k is not None else None                 # (P, L, heads*n)
-        return u, self.W_delta(x), self.W_B(x), kx, valid.bool()
+        dx, bx, valid = self.W_delta(x), self.W_B(x), valid.bool()
+        if self.roles is not None:
+            if extras is None:
+                raise ValueError('kgts.roles needs TokenBank side information (bank(..., extras=True))')
+            perm, valid = self.orders(valid, extras)
+            u, dx, bx = self.take(u, perm), self.take(dx, perm), self.take(bx, perm)
+            kx = self.take(kx, perm) if kx is not None else None
+        u = u.transpose(1, 2)                                              # (P, di, L)
+        u = torch.cat([u, u.flip(-1)], 1).contiguous()                     # (P, 2di, L)
+        return u, dx, bx, kx, valid
+
+    @torch.no_grad()
+    def orders(self, valid, extras):
+        """Per-head scan order (P, L, heads), ascending key, and the per-head valid mask in that order."""
+        P, L = valid.shape
+        key = torch.zeros(P, L, self.heads, device=valid.device)          # 'int': all ties -> frame order
+        sel = torch.tensor([r != 'int' for r in self.roles], device=valid.device)
+        for h, r in enumerate(self.roles):
+            if r == 'geo':
+                key[..., h] = -(extras['pos'].float() - self.ANCHOR).pow(2).sum(-1)
+            elif r == 'con':
+                key[..., h] = extras['cons'].float()
+        # selectors skip the keyframe's taps; their invalid taps go first (dt = 0 there anyway)
+        vh = valid.unsqueeze(-1) & ~(sel & extras['is_ref'].to(valid.device)[:, None])
+        key = key.masked_fill(sel & ~vh, float('-inf'))
+        perm = key.argsort(dim=1, stable=True)
+        return perm, vh.gather(1, perm)
+
+    def take(self, t, perm):
+        """Reorder the taps of a (P, L, heads*m) tensor, head block h by perm[..., h]."""
+        P, L, H = perm.shape
+        t = t.view(P, L, H, -1)
+        return t.gather(1, perm.unsqueeze(-1).expand(-1, -1, -1, t.shape[-1])).view(P, L, -1)
 
     def conditioned(self, s, cache):
         """s must already be normalised (norm_s). Returns the scan inputs; delta is the
@@ -384,10 +539,14 @@ class KGTS(nn.Module):
             q = self.W_q(s).view(P, 1, self.heads, self.n)
             a = (kx.view(P, L, self.heads, self.n) * q).sum(-1) / math.sqrt(self.n)   # (P, L, heads)
             delta = (delta.view(P, L, self.heads, -1) + a.unsqueeze(-1)).view(P, L, self.di)
-        if self.dt_norm:                                                   # sum over taps = 1
-            delta = TapNormSoftplus.apply(delta + self.delta_bias, valid.unsqueeze(-1), u.dtype)
+        if valid.dim() == 3:                                               # per-head orders (roles)
+            vmask = valid.unsqueeze(-1).expand(-1, -1, -1, self.di // self.heads).reshape(P, L, self.di)
         else:
-            delta = delta.masked_fill(~valid.unsqueeze(-1), -30.0)         # mask AFTER the sum
+            vmask = valid.unsqueeze(-1)
+        if self.dt_norm:                                                   # sum over taps = 1
+            delta = TapNormSoftplus.apply(delta + self.delta_bias, vmask, u.dtype)
+        else:
+            delta = delta.masked_fill(~vmask, -30.0)                       # mask AFTER the sum
         B = bx * self.gamma(s).unsqueeze(1) + self.beta(s).unsqueeze(1)    # (P, L, heads*n)
 
         delta = delta.transpose(1, 2)                                      # (P, di, L)
@@ -407,11 +566,16 @@ class KGTS(nn.Module):
         # whole (P, 2di, L) scan output (L = 56x the end state) until then, at every call
         return y[..., -1].contiguous()
 
-    def forward(self, s, cache):
+    def forward(self, s, cache, idx=0, return_pooled=False):
+        """idx: which injection point this call serves (depth_embed / untie_out).
+        return_pooled: also return the gated pooled states y (P, 2di) that W_c reads."""
         sn = self.norm_s(s)
+        if self.depth_embed is not None:
+            sn = sn + self.depth_embed[idx]
         y = self.out_norm(self.pooled(sn, cache))                          # (P, 2di)
         if self.W_z is not None:
             y = y * F.silu(self.W_z(sn))
-        d_s = self.W_c(y)                                                  # (P, ds)
-        g = torch.sigmoid(self.W_g(torch.cat([sn, d_s], -1)))
-        return s + g * d_s
+        W_c, W_g = (self.W_cs[idx - 1], self.W_gs[idx - 1]) if self.untie_out and idx else (self.W_c, self.W_g)
+        d_s = W_c(y)                                                       # (P, ds)
+        g = torch.sigmoid(W_g(torch.cat([sn, d_s], -1)))
+        return (s + g * d_s, y) if return_pooled else s + g * d_s

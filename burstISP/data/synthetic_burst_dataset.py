@@ -64,6 +64,18 @@ class SyntheticBurstDataset(data.Dataset):
                       val mode: the official val set does not ship flows.
         add_noise   - override the official add_noise=True (default true;
                       intended for smoke tests only, not for benchmark runs)
+        outliers    - train mode only, off by default. dict(prob, max_frames, size, shift):
+                      with probability prob, 1..max_frames non-reference frames get a
+                      square box (side = size x the packed side, random place) replaced
+                      by that frame's own content displaced by `shift` = [lo, hi] packed
+                      px per axis, random sign -- an independently moving object that the
+                      reference does not show. SyntheticBurst motion is one global affine
+                      map per frame: no occlusion, no local motion, so nothing in it ever
+                      rewards rejecting a tap, and a model trained on it meets the first
+                      moving object at test time. The GT is untouched (the reference
+                      defines it). Adds 'flow_mask' [num_frames, 1, 2h, 2w]: 0 where the
+                      generator's flow no longer describes the frame (MambaFusionModel's
+                      flow loss skips those pixels).
     """
 
     def __init__(self, opt):
@@ -142,10 +154,33 @@ class SyntheticBurstDataset(data.Dataset):
         flow_vectors = flow_vectors[order]
 
         rel_path = os.path.relpath(path, self.data_root)
-        return {'lq': burst.float(),
-                'gt': frame_gt.float(),
-                'flow_vectors': flow_vectors.float(),
-                'lq_path': rel_path}
+        out = {'lq': burst.float(),
+               'gt': frame_gt.float(),
+               'flow_vectors': flow_vectors.float(),
+               'lq_path': rel_path}
+        if self.opt.get('outliers'):
+            out['lq'], out['flow_mask'] = self.add_outliers(out['lq'], self.opt['outliers'])
+        return out
+
+    def add_outliers(self, burst, cfg):
+        """See the class docstring (outliers). burst: [N, 4, h, w], reference at N // 2."""
+        n, _, h, w = burst.shape
+        mask = torch.ones(n, 1, 2 * h, 2 * w)
+        if n < 2 or random.random() >= cfg.get('prob', 0.3):
+            return burst, mask
+        burst = burst.clone()
+        ref = n // 2
+        others = [i for i in range(n) if i != ref]
+        k = random.randint(1, min(cfg.get('max_frames', 4), len(others)))
+        side = max(1, int(round(cfg.get('size', 0.33) * min(h, w))))
+        lo, hi = cfg.get('shift', [2, 6])
+        for i in random.sample(others, k):
+            y0, x0 = random.randint(0, h - side), random.randint(0, w - side)
+            dy, dx = (random.randint(lo, hi) * random.choice((-1, 1)) for _ in range(2))
+            moved = torch.roll(burst[i], shifts=(dy, dx), dims=(-2, -1))
+            burst[i, :, y0:y0 + side, x0:x0 + side] = moved[:, y0:y0 + side, x0:x0 + side]
+            mask[i, :, 2 * y0:2 * (y0 + side), 2 * x0:2 * (x0 + side)] = 0
+        return burst, mask
 
     def _get_val_sample(self, index):
         burst, gt, meta_info = self.val_set[index]

@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,6 +40,133 @@ def affine_flow_fit(flow, margin=4, iters=3, size=None):
             c = 2 * (r * w0).sum(1, keepdim=True) / w0.sum(1, keepdim=True)
             wt = w0 / (1 + (r / c.clamp_min(1e-3)) ** 2)
     return (X @ beta).transpose(1, 2).reshape(M, 2, h, w).to(flow.dtype)
+
+
+def gaussian_blur(x, sigma):
+    """Separable Gaussian, replicate padding. x: (M, C, h, w)."""
+    r = max(1, int(math.ceil(3 * sigma)))
+    k = torch.exp(-torch.arange(-r, r + 1, device=x.device, dtype=x.dtype) ** 2 / (2 * sigma ** 2))
+    k, C = k / k.sum(), x.shape[1]
+    x = F.conv2d(F.pad(x, (r, r, 0, 0), mode='replicate'), k.view(1, 1, 1, -1).expand(C, 1, 1, -1), groups=C)
+    return F.conv2d(F.pad(x, (0, 0, r, r), mode='replicate'), k.view(1, 1, -1, 1).expand(C, 1, -1, 1), groups=C)
+
+
+@torch.no_grad()
+def affine_lk(burst, ref_idx, init=None, size=None, sigmas=(2.0, 1.4, 1.0, 0.7), iters=4, margin=2):
+    """Per-frame robust photometric affine registration to the keyframe (Gauss-Newton / Lucas-Kanade).
+
+    burst: (B, N, C, h, w) packed. Returns the backward flow (B, N, 2, h, w), fp32 packed px, one
+    affine map per frame, the keyframe's exactly 0. Residual on the channel-mean image,
+    r(p) = I_i(p - w(p)) + b - I_ref(p), w(p) = M p + t: 6 motion + 1 offset per frame, Tukey
+    biweight IRLS on the median-centred residual with a MAD scale, coarse to fine by blur (sigmas),
+    Levenberg-damped, steps clipped to 1 px. Starts from zero motion and, if `init` (a flow of the
+    same shape) is given, from its affine fit too; per frame the start with the lower final median
+    absolute deviation wins.
+
+    Why: KGTS reads each tap's sub-pixel position straight off this flow, and nothing downstream can
+    correct it. On DBSR bursts (32x32 packed crops, 100 BSD100 bursts x 13 frames, all noise levels)
+    it lands at ~0.08 packed px mean EPE (median ~0.065) from zero motion, the same as from a start
+    0.33 px off, against ~0.35 for the affine fit of the learned flow reported in KGTSAlign's
+    docstring. It needs no training, so it is right from step 0; ~0.3 MMACs per frame. Detached: it
+    is a measurement of the burst (like the generator's flow), not a learned estimate.
+    Robustness: a free photometric gain and Cauchy / mean-|r| weights (the first version) let a
+    moving object covering 1/16 of the frame pull the estimate to 0.20 px (0.09 now). An object
+    covering 1/4 of the frame still defeats any single global model (~1 px): that is what
+    KGTSAlign's `local` hybrid is for -- a wrong global estimate is a coherent residual, so the gate
+    hands such regions to the dense flow.
+    """
+    B, N, C, h, w = burst.shape
+    hv, wv = size or (h, w)
+    dev = burst.device
+    with torch.autocast(device_type=dev.type, enabled=False):
+        lum = burst.float().mean(2, keepdim=True).flatten(0, 1)                      # (M, 1, h, w)
+        refl = lum.view(B, N, 1, h, w)[:, ref_idx:ref_idx + 1].expand(B, N, 1, h, w).flatten(0, 1)
+        M = B * N
+        ys, xs = torch.meshgrid(torch.arange(h, device=dev, dtype=torch.float32),
+                                torch.arange(w, device=dev, dtype=torch.float32), indexing='ij')
+        X = torch.stack([xs / w - 0.5, ys / h - 0.5, torch.ones_like(xs)], -1).view(h * w, 3)
+        m0 = torch.zeros(h, w, device=dev)
+        m0[margin:hv - margin, margin:wv - margin] = 1
+        m0 = m0.view(1, h * w)
+        eye = torch.eye(7, device=dev)
+        nan = torch.tensor(float('nan'), device=dev)
+
+        def run(beta):
+            b = torch.zeros(M, 1, device=dev)
+            for sig in sigmas:
+                I, R = gaussian_blur(lum, sig), gaussian_blur(refl, sig).view(M, -1)
+                for _ in range(iters):
+                    fl = (X @ beta).transpose(1, 2)                                   # (M, 2, hw)
+                    sx, sy = xs.reshape(1, -1) - fl[:, 0], ys.reshape(1, -1) - fl[:, 1]
+                    grid = torch.stack(((2 * sx + 1) / w - 1, (2 * sy + 1) / h - 1), -1).view(M, h, w, 2)
+                    Iw = F.grid_sample(I, grid, mode='bilinear', padding_mode='border', align_corners=False)
+                    gx = (F.pad(Iw, (1, 1, 0, 0), mode='replicate')[..., 2:]
+                          - F.pad(Iw, (1, 1, 0, 0), mode='replicate')[..., :-2]).view(M, -1) / 2
+                    gy = (F.pad(Iw, (0, 0, 1, 1), mode='replicate')[..., 2:, :]
+                          - F.pad(Iw, (0, 0, 1, 1), mode='replicate')[..., :-2, :]).view(M, -1) / 2
+                    Iw = Iw.view(M, -1)
+                    inside = (sx >= 1) & (sx <= wv - 2) & (sy >= 1) & (sy <= hv - 2)
+                    msk = inside.float() * m0
+                    r = Iw + b - R
+                    rn = torch.where(msk > 0, r, nan)
+                    med = rn.nanmedian(1, keepdim=True).values
+                    dev_ = (rn - med).abs()
+                    s = (1.4826 * dev_.nanmedian(1, keepdim=True).values).clamp_min(1e-6)
+                    wt = msk * (1 - ((r - med) / (4.685 * s)) ** 2).clamp_min(0) ** 2     # Tukey biweight
+                    J = torch.cat([-gx[..., None] * X, -gy[..., None] * X, torch.ones_like(Iw)[..., None]], -1)
+                    Jw = J * wt[..., None]                                            # (M, hw, 7)
+                    H = Jw.transpose(1, 2) @ J
+                    H = H + 1e-3 * torch.diag_embed(H.diagonal(dim1=1, dim2=2)) + 1e-8 * eye
+                    d = -torch.linalg.solve(H, (Jw * r[..., None]).sum(1))           # (M, 7)
+                    beta = beta + torch.stack([d[:, 0:3], d[:, 3:6]], -1).clamp(-1.0, 1.0)
+                    b = b + d[:, 6:7]
+            return beta, dev_.nanmedian(1).values
+
+        starts = [torch.zeros(M, 3, 2, device=dev)]
+        if init is not None:                                                         # least-squares affine fit
+            Y = init.detach().float().flatten(0, 1).flatten(2).transpose(1, 2)        # (M, hw, 2)
+            Xm = X * m0.view(-1, 1)
+            starts.append(torch.linalg.solve(Xm.T @ X + 1e-6 * torch.eye(3, device=dev), Xm.T @ Y))
+        best, best_cost = run(starts[0])
+        for beta in starts[1:]:
+            beta, cost = run(beta)
+            better = cost < best_cost
+            best = torch.where(better.view(M, 1, 1), beta, best)
+            best_cost = torch.where(better, cost, best_cost)
+        flow = (X @ best).transpose(1, 2).reshape(B, N, 2, h, w)
+        flow[:, ref_idx] = 0
+    return flow
+
+
+def local_residual(dense, glob, tau=0.25, win=5):
+    """Hybrid flow for bursts with local motion: the global (per-frame affine) flow, plus the dense
+    estimate's residual where it is coherently different from it.
+
+    The dense estimate's error is mostly incoherent noise (~0.3-0.5 packed px per pixel); a moving
+    object or parallax is a spatially coherent residual. A win x win box filter keeps the latter and
+    averages the former down, and the gate ramps from 0 at |smoothed residual| = tau to 1 at 2 tau
+    (packed px, detached). On SyntheticBurst (pure affine motion) it stays ~closed; on real bursts it
+    hands moving regions back to the dense flow instead of the wrong global model."""
+    r = (dense - glob).float()
+    B, N = r.shape[:2]
+    rs = F.avg_pool2d(r.flatten(0, 1), win, 1, win // 2, count_include_pad=False).view_as(r)
+    gate = ((rs.norm(dim=2, keepdim=True) - tau) / tau).clamp(0, 1).detach()
+    return glob + gate * rs
+
+
+class TokenBlock(nn.Module):
+    """Per-frame residual block for the token encoder: depthwise 7x7 -> LN -> 2x pointwise MLP
+    (ConvNeXt). The last pointwise is zero-init, so a stack of these is an identity at init."""
+    def __init__(self, c, k=7, mult=2):
+        super().__init__()
+        self.dw = nn.Conv2d(c, c, k, padding=k // 2, groups=c)
+        self.norm = nn.LayerNorm(c)
+        self.pw1, self.pw2 = nn.Linear(c, mult * c), nn.Linear(mult * c, c)
+        nn.init.zeros_(self.pw2.weight); nn.init.zeros_(self.pw2.bias)
+
+    def forward(self, x):
+        y = self.pw2(F.gelu(self.pw1(self.norm(self.dw(x).permute(0, 2, 3, 1)))))
+        return x + y.permute(0, 3, 1, 2).to(x.dtype)
 
 
 class PreAlign(nn.Module):
@@ -375,10 +503,18 @@ class KGTSAlign(nn.Module):
             translation in 'bayer'; r=1 already covers it in 'packed'.
         num_frames: kept for config compatibility; builds nothing.
         ref_idx: reference-frame index (None -> N // 2). Also the keyframe.
-        global_motion: None | 'affine'. 'affine' replaces the packed flow handed
+        global_motion: None | 'affine' | 'lk'. 'affine' replaces the packed flow handed
             to the tokens by a robust per-frame affine fit of it
             (affine_flow_fit); the returned pyramid stays dense, so the flow
-            loss still supervises every pixel. KGTS reads each tap's sub-pixel
+            loss still supervises every pixel. 'lk' goes further: a robust
+            photometric Gauss-Newton registration of each frame to the keyframe
+            on the burst itself (affine_lk), started from zero motion and from
+            that fit, detached -- ~4x less tap-position error than the fit
+            (0.076 vs ~0.33 packed px on DBSR bursts), right from step 0.
+            Being detached, it leaves FlowAlign's flow heads to train.flow_opt /
+            train.photo_opt alone: keep one of them active on every step (M1 holds
+            flow_lambda at a floor), else DDP with find_unused_parameters: false
+            fails. KGTS reads each tap's sub-pixel
             position off this flow and nothing downstream can correct it: at
             x8, 0.1 packed px of flow error is 0.8 HR px of misplaced sample.
             A dense per-pixel estimate from 5x5-receptive-field convs on noisy
@@ -390,22 +526,37 @@ class KGTSAlign(nn.Module):
             further training has to; the local half it removes outright.
             Exact for SyntheticBurst (one affine map per frame; the fit of
             its flow_vectors is off by 1e-5 px). For real bursts with local
-            motion (RealBSR) leave it None.
+            motion (RealBSR) combine it with `local`, or leave it None.
         gm_margin: packed px at each border excluded from the fit (content that
             leaves the view has no correspondence; SyntheticBurst's largest
             shift is ~3.6 packed px).
+        lk: dict of affine_lk options (sigmas, iters, margin) for global_motion 'lk'.
+        local: None | dict(tau, win): hybrid flow (local_residual) -- the global
+            model plus the dense estimate's residual where it is coherently
+            different (moving objects, parallax). Needs global_motion. What makes
+            a global motion model safe on real bursts; ~closed on SyntheticBurst.
+        token_blocks: residual TokenBlocks (depthwise 7x7 + pointwise MLP, zero-init)
+            after the token encoder, per frame. The encoder is otherwise 5 convs
+            deep (RF 11 packed px, ~78k params) against the keyframe's 24-layer
+            body: whatever the body learns, every other frame reaches it only
+            through these features. Each block adds +6 px of RF and ~0.045
+            GMACs per 48x48 frame at token_feat 64.
     """
     def __init__(self, in_chans=4, type='bayer', flow_feat=64, flow_in_chans=None, token_feat=64,
-                 r=2, num_frames=14, ref_idx=None, global_motion=None, gm_margin=4):
+                 r=2, num_frames=14, ref_idx=None, global_motion=None, gm_margin=4, lk=None, local=None,
+                 token_blocks=0):
         super().__init__()
         if type not in ('bayer', 'packed'):
             raise ValueError(f"align.type must be 'bayer' or 'packed', got {type!r}")
-        if global_motion not in (None, 'affine'):
-            raise ValueError(f"align.global_motion must be None or 'affine', got {global_motion!r}")
+        if global_motion not in (None, 'affine', 'lk'):
+            raise ValueError(f"align.global_motion must be None, 'affine' or 'lk', got {global_motion!r}")
+        if local is not None and global_motion is None:
+            raise ValueError('align.local refines a global motion model: set align.global_motion too')
         self.type = type
         self.ref_idx = ref_idx
         self.token_feat = token_feat
         self.global_motion, self.gm_margin = global_motion, gm_margin
+        self.lk, self.local = dict(lk or {}), (None if local is None else dict(local))
 
         if type == 'bayer':
             flow_in_chans = flow_in_chans or flow_feat
@@ -424,6 +575,8 @@ class KGTSAlign(nn.Module):
                 nn.Conv2d(token_feat, token_feat, kernel_size=3, padding=1),
                 nn.LeakyReLU(0.1, inplace=True),
             )
+        self.token_blocks = nn.Sequential(*[TokenBlock(token_feat) for _ in range(token_blocks)]) \
+            if token_blocks else None
 
     def forward(self, burst, ref_idx, size=None):
         """burst: (B, N, in_chans, h, w) packed, normalised. size: (h, w) of the unpadded
@@ -438,6 +591,14 @@ class KGTSAlign(nn.Module):
             x = torch.cat([burst, feats], 2).reshape(B * N, -1, h, w)
             feats = self.token_enc(x).view(B, N, self.token_feat, h, w)
             flow = flows['lv1'].float()
+        if self.token_blocks is not None:
+            feats = self.token_blocks(feats.flatten(0, 1)).view_as(feats)
+        dense = flow
         if self.global_motion == 'affine':
             flow = affine_flow_fit(flow.flatten(0, 1), self.gm_margin, size=size).view_as(flow)
+        elif self.global_motion == 'lk':
+            fit = affine_flow_fit(flow.flatten(0, 1), self.gm_margin, size=size).view_as(flow)
+            flow = affine_lk(burst, ref_idx, init=fit, size=size, **self.lk)
+        if self.local is not None:
+            flow = local_residual(dense, flow, **self.local)
         return feats, flow, flows

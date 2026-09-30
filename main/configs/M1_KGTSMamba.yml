@@ -190,6 +190,9 @@ train:
     loss_weight: 1.0
     reduction: mean
   flow_lambda:
+    # NOTE these milestones are read in MICRO-steps (optimize_parameters gets train.py's
+    # micro_step): with accumulation_steps 2 they land at optimizer iterations 15k / 30k.
+    # `unit: iter` reads them as iterations (M2 does); left unset here so M1 is unchanged.
     milestones: [0, 30000, 60000]
     values: [0.5, 0.1, 0.05]
   flow_levels: [lv1, lv2, lv3]

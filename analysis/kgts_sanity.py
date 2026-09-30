@@ -67,7 +67,7 @@ def stage_scan(net_opt):
     """KGTS with the config's shapes, small P: kernel vs reference, fp32."""
     torch.backends.cuda.matmul.allow_tf32 = False     # TF32 Linears alone would miss the 1e-3 fwd bar
     kg = dict(net_opt.get('kgts', {}))
-    kg.pop('d', None); kg.pop('ds', None)
+    kg.pop('d', None); kg.pop('ds', None); kg.pop('n_calls', None)
     d, ds = net_opt.get('token', {}).get('d', 16), net_opt['embed_dim']
     torch.manual_seed(0)
     k_cpu = KGTS(ds, d, **kg)
@@ -79,16 +79,21 @@ def stage_scan(net_opt):
     k_gpu = KGTS(ds, d, **kg).to(DEV)
     k_gpu.load_state_dict(k_cpu.state_dict())
 
-    P, L = 64, 14 * net_opt.get('token', {}).get('k', 2) ** 2
+    kk = net_opt.get('token', {}).get('k', 2)
+    P, L = 64, 14 * kk ** 2
     x, s = torch.randn(P, L, d), torch.randn(P, ds)
     valid = torch.rand(P, L) > 0.1
+    # side information for kgts.roles (TokenBank(extras=True) supplies it in the model)
+    extras = {'pos': torch.rand(P, L, 2) * 2 - 0.5, 'cons': -torch.rand(P, L),
+              'is_ref': torch.arange(L) // kk ** 2 == 7}
+    ex = lambda dev: {k_: v.to(dev) for k_, v in extras.items()}
 
     outs, grads = [], []
     for k, dev in ((k_cpu, 'cpu'), (k_gpu, DEV)):
         # fresh leaves per device: x.to("cpu") returns x itself, so requires_grad_ on it
         # would make the later x.to("cuda") a non-leaf whose .grad is never populated
         xs, ss = (t.detach().clone().to(dev).requires_grad_() for t in (x, s))
-        out = k(ss, k.precompute(xs, valid.to(dev)))
+        out = k(ss, k.precompute(xs, valid.to(dev), ex(dev)))
         out.pow(2).mean().backward()
         outs.append(out.detach().cpu())
         grads.append({'x': xs.grad.cpu(), 's': ss.grad.cpu(),
@@ -106,7 +111,7 @@ def stage_scan(net_opt):
     # which frames does this scan read at init? share of ||d end_states / d taps||^2 per frame
     N = L // net_opt.get('token', {}).get('k', 2) ** 2
     xs = x.detach().clone().to(DEV).requires_grad_()
-    y = k_gpu.pooled(k_gpu.norm_s(s.to(DEV)), k_gpu.precompute(xs, torch.ones_like(valid).to(DEV)))
+    y = k_gpu.pooled(k_gpu.norm_s(s.to(DEV)), k_gpu.precompute(xs, torch.ones_like(valid).to(DEV), ex(DEV)))
     acc = torch.zeros_like(xs)
     for _ in range(8):
         g, = torch.autograd.grad((y * torch.randn_like(y)).sum(), xs, retain_graph=True)
@@ -197,10 +202,12 @@ def stage_overfit(opt, net_opt, iters, batch, log_every):
     optim = torch.optim.AdamW(net.parameters(), lr=tr['optim_g']['lr'], betas=tr['optim_g']['betas'])
     lam = tr.get('flow_lambda', {}).get('values', [0.0])[0] if tr.get('flow_opt') else 0.0
     clip = opt['datasets']['train'].get('grad_clip_norm', tr.get('grad_clip_norm', 1.0))
+    lam_aux = tr.get('aux_lambda', {}).get('values', [1.0])[0] if tr.get('aux_opt') else 0.0
 
     ratios = []
     def hook(mod, inp, out):
         s = inp[0].detach().float()
+        out = out[0] if isinstance(out, tuple) else out          # (s, pooled) when aux_head asks for it
         ratios.append(((out.detach().float() - s).norm() / s.norm().clamp_min(1e-12)).item())
     net.kgts.register_forward_hook(hook)
 
@@ -228,7 +235,8 @@ def stage_overfit(opt, net_opt, iters, batch, log_every):
         out = out.float()
         l_pix = F.l1_loss(out, gt)
         l_flow, epe = flow_terms(aux['flows'])
-        (l_pix + lam * l_flow).backward()
+        l_aux = F.l1_loss(aux['burst'].float(), gt) * lam_aux if 'burst' in aux else 0
+        (l_pix + lam * l_flow + l_aux).backward()
         torch.nn.utils.clip_grad_norm_(net.parameters(), clip)
         optim.step()
         if not math.isfinite(l_pix.item()):

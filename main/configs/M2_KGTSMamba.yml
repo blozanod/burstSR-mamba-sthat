@@ -1,0 +1,231 @@
+# M2_KGTSMamba — M1 with the burst branch hardened (docs/KGTS_ADVERSARIAL_REVIEW.md).
+#
+# Same body, recipe and data as M1_KGTSMamba.yml; every difference is a flag that
+# is off in M1, so M2 - M1 is exactly the review's changes. Per change (all
+# measured on CPU at reduced width; see the review for numbers and caveats):
+#
+#   align.global_motion: lk   tap geometry from a photometric affine registration
+#                             of the burst itself: 0.076 vs ~0.33 packed px EPE, from step 0
+#   align.token_blocks: 2     per-frame tokens get 2 residual blocks (RF 11 -> 23 px)
+#   refine.at: [2]            tokens re-expressed in the keyframe state after call 2;
+#                             calls 3..6 read tokens that deepened with the body
+#   kgts.roles                4 integrators + 2 geometric + 2 consistency selectors,
+#                             selectors scanned in relevance order (frame-order invariant)
+#   kgts.out_norm: group      each head normalised on its own before W_c mixes them
+#   kgts.depth_embed/untie_out  the tied KGTS knows which depth it serves, and each
+#                             depth writes its own subspace
+#   inject_first              the first ASSB already sees the burst
+#   aux_head + train.aux_opt  the burst branch gets gradient from step 0 (W_c is zero-init)
+#   train.*.unit: iter        schedules in optimizer iterations, not micro-steps (the
+#                             M1/L6 milestones run 2x/4x fast, see MambaFusionModel._lambda)
+#   train.burst_aug           random frame subsets / orders: the burst is a set
+#   train.ema_decay           weight EMA for validation / release
+#
+# Budget vs M1 (analytic, 48x48, 14 frames): +2.2 GMACs inject_first call, +6.4
+# refine (TokenRefine 2.2 + a second token cache 4.2), +1.3 token_blocks, +0.1 aux,
+# LK ~0 -> ~85 GMACs. Params +0.80M (untie_out 0.67M of it) -> ~19.9M. Re-measure
+# with budget_check.py M2 and analysis/kgts_sanity.py before the first launch.
+# Memory: refine holds a second token cache (~0.7 GB bf16 at batch 4); if batch 4
+# OOMs on A10, set use_checkpoint: true first (it checkpoints the refinement too).
+name: M2_KGTSMamba
+model_type: MambaFusionModel
+scale: 8
+num_gpu: 4
+manual_seed: 42
+find_unused_parameters: false
+
+# Dataset
+datasets:
+  train:
+    name: SyntheticBurst_train
+    type: SyntheticBurstDataset
+    dataroot: /groups/rls/blozanod/MambaFusion/dataset/Zurich-RAW-to-RGB
+    num_frames: 14
+    phase: train
+    scale: 8
+    batch_size_per_gpu: 4
+    num_worker_per_gpu: 6
+    dataset_enlarge_ratio: 1
+    grad_clip_norm: 1
+    # Moving-object outliers (off here: SyntheticBurstVal has none, so for the
+    # benchmark number alone they only cost signal). Turn on for the run that
+    # pretrains a real-data model (M2_KGTSMamba_RealBSR.yml): synthetic motion is
+    # one affine map per frame, so without them nothing ever rewards the
+    # consistency selectors for rejecting a tap.
+    # outliers: {prob: 0.3, max_frames: 3, size: 0.33, shift: [2, 6]}
+
+  val:
+    name: SyntheticBurst_val
+    type: SyntheticBurstDataset
+    dataroot: /groups/rls/blozanod/MambaFusion/dataset/SyntheticBurstVal
+    num_frames: 14
+    phase: val
+    scale: 8
+
+# Network
+network_g:
+  type: KGTSMamba
+
+  # ---- MambaIRv2 keyframe body: identical to M1 ----
+  img_size: 48
+  in_chans: 4
+  out_chans: 3
+  embed_dim: 180
+  d_state: 64
+  depths: [4, 4, 4, 4, 4, 4]
+  num_heads: [6, 6, 6, 6, 6, 6]
+  window_size: 16
+  inner_rank: 64
+  num_tokens: 128
+  convffn_kernel_size: 5
+  mlp_ratio: 2
+  upscale: 8
+  img_range: 1.0
+  upsampler: 'pixelshuffle'
+  upsample_feat: 64
+  resi_connection: '1conv'
+  use_checkpoint: false
+
+  # ---- burst-branch wiring ----
+  inject_first: true     # a 7th tied KGTS call before the first ASSB (call 0)
+  refine:
+    at: [2]              # after calls 0..2 (pre-body, ASSB 1, ASSB 2); calls 3..6 read the refined bank
+    hidden: 128
+  aux_head: true         # burst-only reconstruction from call 0; needs train.aux_opt
+
+  # ---- Alignment front-end (KGTSAlign) ----
+  align:
+    type: packed
+    flow_feat: 32
+    flow_in_chans: ~
+    r: 2
+    num_frames: 14
+    ref_idx: ~
+    # Photometric affine registration of each frame to the keyframe (affine_lk),
+    # started from zero motion and from the fit of FlowAlign's dense flow; the
+    # lower-cost start wins per frame. Detached: FlowAlign's heads train from
+    # the flow loss, which is why flow_lambda keeps a floor below.
+    global_motion: lk
+    gm_margin: 4
+    token_blocks: 2
+
+  # ---- TokenBank: identical to M1 ----
+  token:
+    c: 64
+    d: 64
+    k: 2
+    pos_freqs: [0.5, 1, 2, 4]
+    norm: true
+    mark_ref: true
+    pin_ref: true
+    tap_pos: backward
+
+  # ---- KGTS ----
+  kgts:
+    n: 16
+    expand: 2
+    heads: 8
+    # int: accumulate every tap (frame order, a_max) -- denoising, sample gathering
+    # geo: nearest samples to the pixel's HR block scanned last (a_max_sel)
+    # con: taps most consistent with the keyframe scanned last (a_max_sel);
+    #      the backward copy of a selector reads the least consistent (an outlier readout)
+    roles: [int, int, int, int, geo, geo, con, con]
+    a_max_sel: 8
+    norm_s: true
+    out_gate: true
+    out_norm: group
+    dt_min: 0.01
+    dt_max: 0.1
+    a_max: 0.5
+    affinity: true
+    dt_norm: false
+    depth_embed: true
+    untie_out: true
+
+# Training
+path:
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+  experiments_root: ~
+
+train:
+  accumulation_steps: 2
+  total_iter: 300000
+  warmup_iter: 2000
+  compand: false
+  ema_decay: 0.999
+
+  optim_g:
+    type: AdamW
+    lr: !!float 1e-4
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [300000]
+    restart_weights: [1]
+    eta_min: !!float 1e-6
+
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+  flow_opt:
+    type: CharbonnierLoss
+    loss_weight: 1.0
+    reduction: mean
+  flow_lambda:
+    milestones: [0, 30000, 60000]
+    values: [0.5, 0.1, 0.05]
+    unit: iter           # optimizer iterations (M1's default 'micro' reaches these at 15k / 30k)
+  flow_levels: [lv1, lv2, lv3]
+  flow_target: backward
+
+  # Burst-only reconstruction from the first KGTS call's pooled states. Strong
+  # while the flow and tokens form, then a floor: with the weight at 0 its
+  # parameters would get no gradient and DDP (find_unused_parameters false) fails.
+  aux_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+  aux_lambda:
+    milestones: [0, 20000]
+    values: [1.0, 0.1]
+    unit: iter
+
+  # The burst is a set: shuffle the non-key frames every batch, and on 20% of
+  # batches keep a random subset of >= 8 frames (robustness to burst length).
+  burst_aug:
+    prob: 0.2
+    min_frames: 8
+    shuffle: true
+
+# Validation
+val:
+  val_freq: 5000
+  save_img: false
+  metrics:
+    psnr_synburst:
+      type: calculate_psnr_synburst
+      boundary_ignore: 40
+      better: higher
+    psnr_linear:
+      type: calculate_psnr_linear
+      crop_border: 40
+      test_y_channel: false
+      better: higher
+    ssim:
+      type: calculate_ssim
+      crop_border: 40
+      input_order: CHW
+      test_y_channel: false
+      better: higher
+
+# Logging
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 10000
+  use_tb_logger: false

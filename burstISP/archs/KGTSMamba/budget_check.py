@@ -40,11 +40,19 @@ CONFIGS = {
     'M1-wide-orig': dict(**M1_BODY, align=dict(type='packed', flow_feat=32, **ORIG_ALIGN),
                          token=dict(c=64, d=64, **ORIG_TOKEN),
                          kgts=dict(n=16, heads=8, expand=2, a_max=16, **ORIG_KGTS)),
+    # main/configs/M2_KGTSMamba.yml (docs/KGTS_ADVERSARIAL_REVIEW.md)
+    'M2':          dict(**M1_BODY, inject_first=True, aux_head=True, refine=dict(at=[2], hidden=128),
+                        align=dict(type='packed', flow_feat=32, global_motion='lk', token_blocks=2),
+                        token=dict(c=64, d=64),
+                        kgts=dict(n=16, heads=8, expand=2, roles=['int'] * 4 + ['geo'] * 2 + ['con'] * 2,
+                                  out_norm='group', depth_embed=True, untie_out=True)),
 }
 if len(sys.argv) > 1:
     CONFIGS = {k: v for k, v in CONFIGS.items() if k in sys.argv[1:]}
 
-PARTS = ('align', 'bank', 'kgts', 'conv_first', 'layers', 'conv_after_body',
+# refiners: TokenRefine (their follow-up KGTS.precompute is counted with kgts); aux runs only with
+# return_aux, so its ~0.11 GMACs (M2) are not in the total
+PARTS = ('align', 'bank', 'kgts', 'refiners', 'aux', 'conv_first', 'layers', 'conv_after_body',
          'conv_before_upsample', 'upsample', 'conv_last')
 
 for name, cfg in CONFIGS.items():
@@ -69,7 +77,7 @@ for name, cfg in CONFIGS.items():
     n_layers = sum(cfg['depths'])
     gm['layers'] += n_layers * P * cfg['embed_dim'] * cfg['mlp_ratio'] * cfg['d_state'] * 3 / 1e9
     pm = {p: sum(q.numel() for q in getattr(model, p).parameters()) / 1e6
-          for p in PARTS if hasattr(model, p)}
+          for p in PARTS if getattr(model, p, None) is not None}
 
     print(f"\n{name}: out {tuple(out.shape)}  "
           f"params {sum(q.numel() for q in model.parameters()) / 1e6:.2f}M  GMACs {sum(gm.values()):.1f}"

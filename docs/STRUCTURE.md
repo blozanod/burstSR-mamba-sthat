@@ -49,6 +49,8 @@ burstSR-mamba-sthat/
 │   ├── configs/                      # launch configs — ALL configs live here
 │   │   ├── M0_MambaIRv2_Keyframe.yml  # keyframe-only MambaIRv2 trunk
 │   │   ├── M1_KGTSMamba.yml       # KGTSMamba
+│   │   ├── M2_KGTSMamba.yml       # M1 + docs/KGTS_ADVERSARIAL_REVIEW.md's changes
+│   │   ├── M2_KGTSMamba_RealBSR.yml  # M2 for real bursts (fine-tune; untested on data)
 │   │   ├── MF_STHAT_L3_SynBase.yml
 │   │   ├── MF_STHAT_L4_OracleOn.yml
 │   │   ├── MF_STHAT_L4_OracleOff.yml
@@ -88,6 +90,7 @@ burstSR-mamba-sthat/
 ├── docs/
 │   ├── STRUCTURE.md                  # this file
 │   ├── HISTORY.md                    # narrative record — NOT ground truth
+│   ├── KGTS_ADVERSARIAL_REVIEW.md    # KGTS flaws, evidence and the M2 flags (2026-09-30)
 │   └── _prune/                       # old docs, staged for review/deletion
 │
 ├── requirements.txt

@@ -10,15 +10,33 @@ try:
 except ImportError:
     selective_scan_fn = None
 
-def tap_gather(feat, flow, k=2):
+def tap_gather(feat, flow, k=2, tap_pos='target'):
     """
     x: [B, N, C, h, w]
     flow: [B, N, 2, h, w]
 
     Returns:
     taps: [B, N, k*k, C, h, w]
-    pos: [B, N, k*k, 2, h, w]   fp32
+    pos: [B, N, k*k, 2, h, w]   fp32, where the tap's sample sits in the reference, relative to p
     valid: [B, N, k*k, h, w]
+
+    The window is always found at p - flow(p). tap_pos says where each tap's
+    sample then sits, and must match what the flow IS:
+    'target': T - (p - flow(p)), the flow read at p (the original). First-order
+        only: off by |grad flow| * |flow| for a forward field, by
+        |grad flow| * |T - p| for a backward one.
+    'forward': the flow is a forward field -- frame i's pixel T shows what the
+        reference shows at T + flow(T) (the generator's flow_vectors). Exact.
+    'backward': the flow is a backward field -- the reference's p shows what
+        frame i shows at p - flow(p) (FlowAlign.warp's convention). The tap's
+        sample sits at the q with q - flow(q) = T: two fixed-point steps,
+        q = T + flow(T + flow(T)), the second one bilinear. Error |grad flow|^2 |flow|.
+    Max error against the generator's true sample positions (SyntheticBurst:
+    1 deg rotations, 24 GT px shifts; analysis/kgts_sanity.py stage geometry),
+    packed px: 'forward' on its field 0.004, 'backward' on its field 0.005 (both
+    ~ the Bayer block centre vs its R sample); 'target' 0.072 on the forward
+    field (0.57 HR px), 0.022 on the backward one; a precise mode on the wrong
+    field ~0.05.
 
     Coordinates are always fp32. Under bf16 autocast the flow arrives as bf16,
     whose spacing is 0.25 px between 32 and 64 (0.5 px up to 128): doing the
@@ -26,6 +44,8 @@ def tap_gather(feat, flow, k=2):
     `pos` exists to carry to a quarter of a packed pixel -- coarser than the
     1/8 px an x8 model has to resolve.
     """
+    if tap_pos not in ('target', 'forward', 'backward'):
+        raise ValueError(f"tap_pos must be 'target', 'forward' or 'backward', got {tap_pos!r}")
     B, N, C, h, w = feat.shape
     feat = feat.reshape(B * N, C, h * w)
     flow = flow.reshape(B * N, 2, h, w).float()
@@ -44,6 +64,7 @@ def tap_gather(feat, flow, k=2):
 
     offs = range(-((k - 1) // 2), k // 2 + 1)
     taps, pos, valid = [], [], []
+    fpad = None   # 'backward': the flow, linearly extrapolated past the border (exact for affine fields)
     for oy in offs:
         for ox in offs:
             tx, ty = (nx + ox).long(), (ny + oy).long()
@@ -53,11 +74,23 @@ def tap_gather(feat, flow, k=2):
             valid.append(ok)
 
             # gather pixels
-            idx = (ty.clamp(0, h - 1) * w + tx.clamp(0, w - 1)).view(B * N, 1, h * w).expand(-1, C, -1)
-            taps.append(feat.gather(2, idx).view(B * N, C, h, w) * ok.unsqueeze(1))
+            flat = (ty.clamp(0, h - 1) * w + tx.clamp(0, w - 1)).view(B * N, 1, h * w)
+            taps.append(feat.gather(2, flat.expand(-1, C, -1)).view(B * N, C, h, w) * ok.unsqueeze(1))
 
             # position
-            pos.append(torch.stack((ox - dx, oy - dy), 1))
+            if tap_pos != 'target':
+                ft = flow.view(B * N, 2, h * w).gather(2, flat.expand(-1, 2, -1)).view(B * N, 2, h, w)
+                qx, qy = tx + ft[:, 0], ty + ft[:, 1]                # the flow read at T
+                if tap_pos == 'backward':                            # q = T + flow(q): once more, at T + flow(T)
+                    if fpad is None:                                 # valid taps land within ~1 px of the grid
+                        m = min(2, h - 1, w - 1)
+                        fpad = 2 * F.pad(flow, (m,) * 4, mode='replicate') - F.pad(flow, (m,) * 4, mode='reflect')
+                    grid = torch.stack(((2 * (qx + m) + 1) / (w + 2 * m) - 1, (2 * (qy + m) + 1) / (h + 2 * m) - 1), -1)
+                    fq = F.grid_sample(fpad, grid, mode='bilinear', padding_mode='border', align_corners=False)
+                    qx, qy = tx + fq[:, 0], ty + fq[:, 1]
+                pos.append(torch.stack((qx - xs, qy - ys), 1))
+            else:
+                pos.append(torch.stack((ox - dx, oy - dy), 1))
 
     return (torch.stack(taps, 1).view(B, N, k * k, C, h, w),
             torch.stack(pos, 1).view(B, N, k * k, 2, h, w),
@@ -93,6 +126,10 @@ class TokenBank(nn.Module):
         noise around an exact 0, and the noise's sign flips floor() between
         the {p-1, p} and {p, p+1} tap pairs. The flow loss still sees the
         estimate (KGTSMamba returns FlowAlign's own pyramid).
+    tap_pos: see tap_gather. It must name the field the flow is
+        trained as: KGTSMamba's FlowAlign is supervised by MambaFusionModel.flow_loss,
+        whose train.flow_target picks 'forward' (the generator's flow_vectors) or
+        'backward' (the field FlowAlign's own warps assume).
 
     Tokenizes the aligned taps once, used for every CFQ
 
@@ -100,9 +137,11 @@ class TokenBank(nn.Module):
     x: [P, L, d]
     valid: [P, L]
     """
-    def __init__(self, c, d, k=2, pos_freqs=(0.5, 1, 2, 4), norm=True, mark_ref=True, pin_ref=True):
+    def __init__(self, c, d, k=2, pos_freqs=(0.5, 1, 2, 4), norm=True, mark_ref=True, pin_ref=True,
+                 tap_pos='backward'):
         super().__init__()
         self.pin_ref = pin_ref
+        self.tap_pos = tap_pos
         self.proj = nn.Conv2d(c, d, 1)
         self.register_buffer('pos_freqs', torch.tensor(pos_freqs, dtype=torch.float32).view(-1),
                              persistent=False)
@@ -130,7 +169,7 @@ class TokenBank(nn.Module):
 
         if self.pin_ref and ref is not None:
             flow = flow * (torch.arange(N, device=flow.device) != ref).view(1, N, 1, 1, 1)
-        taps, pos, valid = tap_gather(feats, flow, self.k)
+        taps, pos, valid = tap_gather(feats, flow, self.k, self.tap_pos)
 
         x = rearrange(taps, 'b n k c h w -> (b h w) (n k) c')
         pos = rearrange(pos, 'b n k c h w -> (b h w) (n k) c') # c = 2
@@ -364,7 +403,9 @@ class KGTS(nn.Module):
         A = -torch.exp(self.A_log.float()).flatten(0, 1)                   # (2di, n)
         bias = None if self.dt_norm else self.delta_bias.float().repeat(2)  # dt_norm: delta is dt already
         y = scan(u, delta, A, B, self.C.float().flatten(0, 1), bias, delta_softplus=not self.dt_norm)
-        return y[..., -1]
+        # a copy, not a view: out_norm saves its input for backward, and a view would pin the
+        # whole (P, 2di, L) scan output (L = 56x the end state) until then, at every call
+        return y[..., -1].contiguous()
 
     def forward(self, s, cache):
         sn = self.norm_s(s)

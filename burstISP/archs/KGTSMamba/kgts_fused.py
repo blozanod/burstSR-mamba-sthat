@@ -37,9 +37,15 @@ try:
 except ImportError:                      # CPU-only installs: KGTS falls back to the scan path
     triton = None
 
-# pixels per program and warps. The backward holds ~8 (pixels, d_inner/heads, n) fp32 tiles.
-BLOCK_P_FWD, WARPS_FWD = 16, 8
-BLOCK_P_BWD, WARPS_BWD = 8, 8
+# (pixels per program, warps) tried per kernel. Each program walks the taps in sequence, so
+# the kernels are bound by load latency, hidden only by how many programs fit on an SM, which
+# the (pixels, d_inner/heads, n) fp32 tiles held in registers decide (~3 in the forward, ~15
+# in the backward). Hardcoded (8, 8) in the backward measured 68 ms per call on an A10 vs a
+# ~5 ms roofline, so the first call per shape times these on the GPU and keeps the fastest.
+FWD_CONFIGS = ((2, 2), (4, 2), (4, 4), (8, 4), (8, 8), (16, 4), (16, 8), (32, 8))
+BWD_CONFIGS = ((2, 2), (2, 4), (4, 2), (4, 4), (4, 8), (8, 4), (8, 8))
+FORCE = None             # (kind, (block_p, warps)) pins a config (tests); kind 'fwd' / 'bwd'
+TUNED = {}               # (kind, shape key) -> ((block_p, warps), [(ms, config), ...])
 
 
 if triton is not None:
@@ -213,6 +219,35 @@ if triton is not None:
         tl.store(PAC + (pb * 4 + 3) * DI * N + dn, tl.sum(mb, axis=0), mask=dn_m)
 
 
+def _launch(kind, key, configs, run, cuda):
+    """run(block_p, warps) launches once and returns its outputs. On CUDA the first call per
+    (kind, key) times every config (fresh outputs each time: nothing accumulates) and keeps the
+    fastest; later calls reuse it. Off CUDA (the interpreter) the first config is used."""
+    if FORCE is not None and FORCE[0] == kind:
+        return run(*FORCE[1])
+    if not cuda:
+        return run(*configs[0])
+    if (kind, key) not in TUNED:
+        times = []
+        for c in configs:
+            run(*c)                                              # compile, warm up
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(3):
+                run(*c)
+            end.record()
+            end.synchronize()
+            times.append((start.elapsed_time(end) / 3, c))
+        TUNED[kind, key] = (min(times)[1], sorted(times))
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()) \
+                or torch.distributed.get_rank() == 0:
+            ms, (bp, w) = min(times)
+            print(f'[kgts_fused] {kind} {dict(zip(("P", "L", "d_inner", "heads", "n", "affinity"), key))}: '
+                  f'BLOCK_P={bp} warps={w} {ms:.2f} ms (tried ' + ', '.join(f'{c[0]}/{c[1]}: {t:.1f}'
+                                                                           for t, c in sorted(times)) + ')')
+    return run(*TUNED[kind, key][0])
+
+
 def _meta(dx, valid, A, kx):
     P, L, DI = dx.shape
     H, N = valid.shape[-1], A.shape[-1]
@@ -225,11 +260,16 @@ class _EndState(torch.autograd.Function):
     @staticmethod
     def forward(ctx, dx, u, bx, kx, q, valid, ud, bias, gam, bet, A, C, scale):
         P, L, meta = _meta(dx, valid, A, kx)
-        y = torch.empty(P, 2 * meta['DI'], device=dx.device, dtype=torch.float32)
         kx_, q_ = (kx, q) if kx is not None else (bx, gam)          # never read without affinity
-        _fwd[(triton.cdiv(P, BLOCK_P_FWD), meta['H'])](
-            dx, u, bx, kx_, q_, valid, ud, bias, gam, bet, A, C, y, P, L, scale,
-            BLOCK_P=BLOCK_P_FWD, num_warps=WARPS_FWD, **meta)
+
+        def run(bp, warps):
+            y = torch.empty(P, 2 * meta['DI'], device=dx.device, dtype=torch.float32)
+            _fwd[(triton.cdiv(P, bp), meta['H'])](
+                dx, u, bx, kx_, q_, valid, ud, bias, gam, bet, A, C, y, P, L, scale,
+                BLOCK_P=bp, num_warps=warps, **meta)
+            return y
+        y = _launch('fwd', (P, L) + tuple(meta[k] for k in ('DI', 'H', 'N', 'HAS_AFF')), FWD_CONFIGS, run,
+                    dx.is_cuda)
         ctx.save_for_backward(dx, u, bx, kx, q, valid, ud, bias, gam, bet, A, C)
         ctx.scale = scale
         return y
@@ -240,17 +280,24 @@ class _EndState(torch.autograd.Function):
         P, L, meta = _meta(dx, valid, A, kx)
         DI, N = meta['DI'], meta['N']
         f32 = dict(device=dx.device, dtype=torch.float32)
-        gdx, gu, gbx = torch.empty_like(dx), torch.empty_like(u), torch.empty_like(bx)
-        gud, ggam, gbet = torch.empty(ud.shape, **f32), torch.empty(gam.shape, **f32), torch.empty(bet.shape, **f32)
         has = kx is not None
-        gkx, gq = (torch.empty_like(kx), torch.empty(q.shape, **f32)) if has else (None, None)
-        nb = triton.cdiv(P, BLOCK_P_BWD)
-        pbias, pac = torch.empty(nb, DI, **f32), torch.empty(nb, 4, DI, N, **f32)
         kx_, q_ = (kx, q) if has else (bx, gam)
-        _bwd[(nb, meta['H'])](
-            dx, u, bx, kx_, q_, valid, ud, bias, gam, bet, A, C, gy.contiguous(),
-            gdx, gu, gbx, gkx if has else gbx, gq if has else ggam, gud, ggam, gbet, pbias, pac,
-            P, L, ctx.scale, BLOCK_P=BLOCK_P_BWD, num_warps=WARPS_BWD, **meta)
+        gy = gy.contiguous()
+
+        def run(bp, warps):
+            gdx, gu, gbx = torch.empty_like(dx), torch.empty_like(u), torch.empty_like(bx)
+            gud, ggam, gbet = (torch.empty(ud.shape, **f32), torch.empty(gam.shape, **f32),
+                               torch.empty(bet.shape, **f32))
+            gkx, gq = (torch.empty_like(kx), torch.empty(q.shape, **f32)) if has else (None, None)
+            nb = triton.cdiv(P, bp)
+            pbias, pac = torch.empty(nb, DI, **f32), torch.empty(nb, 4, DI, N, **f32)
+            _bwd[(nb, meta['H'])](
+                dx, u, bx, kx_, q_, valid, ud, bias, gam, bet, A, C, gy,
+                gdx, gu, gbx, gkx if has else gbx, gq if has else ggam, gud, ggam, gbet, pbias, pac,
+                P, L, ctx.scale, BLOCK_P=bp, num_warps=warps, **meta)
+            return gdx, gu, gbx, gkx, gq, gud, ggam, gbet, pbias, pac
+        gdx, gu, gbx, gkx, gq, gud, ggam, gbet, pbias, pac = _launch(
+            'bwd', (P, L) + tuple(meta[k] for k in ('DI', 'H', 'N', 'HAS_AFF')), BWD_CONFIGS, run, dx.is_cuda)
         pac = pac.sum(0)
         return (gdx, gu, gbx, gkx, gq.to(q.dtype) if has else None, None, gud.to(ud.dtype),
                 pbias.sum(0).to(bias.dtype), ggam.to(gam.dtype), gbet.to(bet.dtype), pac[:2], pac[2:], None)

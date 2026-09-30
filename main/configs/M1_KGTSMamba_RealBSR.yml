@@ -1,0 +1,195 @@
+# M1_KGTSMamba_RealBSR — M1 for real bursts (RealBSR-RAW). UNTESTED on data:
+# every option was exercised on CPU (docs/KGTS_ADVERSARIAL_REVIEW.md), none on RealBSR.
+#
+# What changes from M1_KGTSMamba.yml, and why:
+#   align.local        real bursts have moving objects and parallax; the global
+#                      affine model is wrong there. The hybrid hands coherently
+#                      disagreeing regions back to FlowAlign's dense flow.
+#   train.photo_opt    RealBSR has no flow ground truth. A self-supervised
+#                      photometric loss (keyframe vs each frame warped by the lv1
+#                      flow, blurred channel mean, + smoothness) replaces flow_opt
+#                      and keeps FlowAlign's heads trained (and used, for DDP).
+#   pretrain           start from an M1 run on SyntheticBurst trained WITH
+#                      datasets.train.outliers on, so the consistency selectors
+#                      have learned to reject taps before they meet real motion.
+#   compand: true      the RealBSR recipe (config.yml); psnr_srgb metrics.
+#   burst_aug          frame subsets from 4 frames up (real bursts vary in length).
+name: M1_KGTSMamba_RealBSR
+model_type: MambaFusionModel
+scale: 8
+num_gpu: 4
+manual_seed: 42
+find_unused_parameters: false
+
+datasets:
+  train:
+    name: RealBSR_train
+    type: BurstImageDataset
+    dataroot: /groups/rls/blozanod/MambaFusion/dataset/RealBSR_RAW_trainpatch
+    num_frames: 14
+    phase: train
+    scale: 8
+    batch_size_per_gpu: 2
+    num_worker_per_gpu: 6
+    dataset_enlarge_ratio: 1
+    grad_clip_norm: 1
+
+  val:
+    name: RealBSR_val
+    type: BurstImageDataset
+    dataroot: /groups/rls/blozanod/MambaFusion/dataset/RealBSR_RAW_testpatch
+    num_frames: 14
+    phase: val
+    scale: 8
+
+network_g:
+  type: KGTSMamba
+  img_size: 80           # RealBSR RAW train patches are 80x80 packed
+  in_chans: 4
+  out_chans: 3
+  embed_dim: 180
+  d_state: 64
+  depths: [4, 4, 4, 4, 4, 4]
+  num_heads: [6, 6, 6, 6, 6, 6]
+  window_size: 16
+  inner_rank: 64
+  num_tokens: 128
+  convffn_kernel_size: 5
+  mlp_ratio: 2
+  upscale: 8
+  img_range: 1.0
+  upsampler: 'pixelshuffle'
+  upsample_feat: 64
+  resi_connection: '1conv'
+  use_checkpoint: true   # 80x80 packed is 2.8x the pixels of 48x48
+
+  inject_first: true
+  refine:
+    at: [2]
+    hidden: 128
+  aux_head: true
+
+  align:
+    type: packed
+    flow_feat: 32
+    flow_in_chans: ~
+    r: 2
+    num_frames: 14
+    ref_idx: ~
+    global_motion: lk
+    gm_margin: 4
+    # global affine + the dense flow's residual where it coherently disagrees
+    # (|5x5-smoothed residual| ramps the gate from 0.25 to 0.5 packed px)
+    local: {tau: 0.25, win: 5}
+    token_blocks: 2
+
+  token:
+    c: 64
+    d: 64
+    k: 2
+    pos_freqs: [0.5, 1, 2, 4]
+    norm: true
+    mark_ref: true
+    pin_ref: true
+    tap_pos: backward
+
+  kgts:
+    n: 16
+    expand: 2
+    heads: 8
+    roles: [int, int, int, int, geo, geo, con, con]
+    a_max_sel: 8
+    norm_s: true
+    out_gate: true
+    out_norm: group
+    dt_min: 0.01
+    dt_max: 0.1
+    a_max: 0.5
+    affinity: true
+    dt_norm: false
+    depth_embed: true
+    untie_out: true
+
+path:
+  # an M1_KGTSMamba checkpoint trained with datasets.train.outliers on (same arch)
+  pretrain_network_g: ~
+  strict_load_g: true
+  resume_state: ~
+  experiments_root: ~
+
+train:
+  accumulation_steps: 4  # 2 x 4 GPUs x 4 = 32
+  total_iter: 100000
+  warmup_iter: 1000
+  compand: true
+  ema_decay: 0.999
+
+  optim_g:
+    type: AdamW
+    lr: !!float 5e-5
+    weight_decay: 0
+    betas: [0.9, 0.99]
+
+  scheduler:
+    type: CosineAnnealingRestartLR
+    periods: [100000]
+    restart_weights: [1]
+    eta_min: !!float 1e-6
+
+  pixel_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+
+  # no flow_vectors in real data: self-supervised photometric flow loss instead
+  photo_opt:
+    type: CharbonnierLoss
+    loss_weight: 1.0
+    reduction: mean
+    eps: !!float 1e-6
+  photo_lambda:
+    milestones: [0]
+    values: [0.1]
+    unit: iter
+  photo_smooth: 0.1      # first-order smoothness of the lv1 flow (packed px)
+  photo_sigma: 1.0       # blur of the channel mean before comparing (noise, Bayer aliasing)
+  photo_when: no_gt
+
+  aux_opt:
+    type: L1Loss
+    loss_weight: 1.0
+    reduction: mean
+  aux_lambda:
+    milestones: [0, 10000]
+    values: [0.5, 0.1]
+    unit: iter
+
+  burst_aug:
+    prob: 0.3
+    min_frames: 4
+    shuffle: true
+
+val:
+  val_freq: 5000
+  save_img: false
+  metrics:
+    psnr_srgb:
+      type: calculate_psnr_srgb
+      crop_border: 40
+      test_y_channel: false
+      better: higher
+    psnr_linear:
+      type: calculate_psnr_linear
+      crop_border: 40
+      test_y_channel: false
+      better: higher
+    ssim:
+      type: calculate_ssim_srgb
+      crop_border: 40
+      test_y_channel: false
+      better: higher
+
+logger:
+  print_freq: 100
+  save_checkpoint_freq: 5000
+  use_tb_logger: false

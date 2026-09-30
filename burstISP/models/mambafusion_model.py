@@ -46,8 +46,41 @@ class MambaFusionModel(SRModel):
         # Set before super().__init__, which may call init_training_settings.
         # A model built for inference never runs optimize_parameters, but this
         # keeps the attribute defined either way.
-        self.cri_flow = None
+        self.cri_flow = self.cri_aux = self.cri_photo = None
+        self.burst_aug = None
         super(MambaFusionModel, self).__init__(opt)
+
+    @staticmethod
+    def _schedule(sched, name):
+        """(milestones, values, unit) of a piecewise-linear lambda(t) config dict."""
+        ms, vs = list(sched.get('milestones', [0])), list(sched.get('values', [1.0]))
+        if len(ms) != len(vs):
+            raise ValueError(f'train.{name}.milestones and .values must be the same length, got {len(ms)} and {len(vs)}')
+        unit = sched.get('unit', 'micro')
+        if unit not in ('micro', 'iter'):
+            raise ValueError(f"train.{name}.unit must be 'micro' or 'iter', got {unit!r}")
+        return ms, vs, unit
+
+    def _lambda(self, sched, micro_step):
+        """lambda(t) of a _schedule, linear between milestones, flat outside them.
+        optimize_parameters is called with train.py's MICRO-step (it counts every forward, so
+        with accumulation_steps: k it runs k x faster than the iteration counter everything
+        else is logged and scheduled by). unit: 'micro' keeps that (the historical behaviour);
+        'iter' converts to optimizer iterations, the unit the milestones are written in."""
+        ms, vs, unit = sched
+        t = micro_step
+        if unit == 'iter':
+            acc = self.opt['train'].get('accumulation_steps', 1)
+            t = (micro_step + acc - 1) // acc
+        if t <= ms[0]:
+            return float(vs[0])
+        if t >= ms[-1]:
+            return float(vs[-1])
+        for i in range(1, len(ms)):
+            if t <= ms[i]:
+                span = max(ms[i] - ms[i - 1], 1)
+                return float(vs[i - 1] + (t - ms[i - 1]) / span * (vs[i] - vs[i - 1]))
+        return float(vs[-1])
 
     def init_training_settings(self):
         """SRModel's setup plus the optional alignment-flow criterion.
@@ -64,12 +97,8 @@ class MambaFusionModel(SRModel):
         if train_opt.get('flow_opt'):
             self.cri_flow = build_loss(train_opt['flow_opt']).to(self.device)
             # Piecewise-linear lambda(t). Duplicate a milestone to get a step.
-            sched = train_opt.get('flow_lambda', {})
-            self.flow_milestones = list(sched.get('milestones', [0]))
-            self.flow_values = list(sched.get('values', [1.0]))
-            if len(self.flow_milestones) != len(self.flow_values):
-                raise ValueError('train.flow_lambda.milestones and .values must be the same length, '
-                                 f'got {len(self.flow_milestones)} and {len(self.flow_values)}')
+            self.flow_sched = self._schedule(train_opt.get('flow_lambda', {}), 'flow_lambda')
+            self.flow_milestones, self.flow_values = self.flow_sched[:2]
             # Equal weight per level; keys must exist in the arch's aux dict.
             self.flow_levels = list(train_opt.get('flow_levels', ['lv1', 'lv2', 'lv3']))
             # 'forward': the generator's flow_vectors as they are. 'backward': the field a
@@ -80,6 +109,33 @@ class MambaFusionModel(SRModel):
         else:
             self.cri_flow = None
 
+        # Burst-only auxiliary reconstruction (KGTSMamba aux_head): aux['burst'] vs gt.
+        bare = self.get_bare_model(self.net_g)
+        has_aux = getattr(bare, 'aux', None) is not None
+        if train_opt.get('aux_opt'):
+            if not has_aux:
+                raise ValueError('train.aux_opt is set but network_g has no aux head (KGTSMamba aux_head: true)')
+            self.cri_aux = build_loss(train_opt['aux_opt']).to(self.device)
+            self.aux_sched = self._schedule(train_opt.get('aux_lambda', {}), 'aux_lambda')
+        elif has_aux:
+            raise ValueError('network_g has an aux head but train.aux_opt is not set: its parameters would '
+                             'get no gradient (DDP with find_unused_parameters: false fails on that)')
+
+        # Self-supervised photometric flow loss, for bursts without flow_vectors (real data): the
+        # keyframe vs every frame warped by FlowAlign's lv1 flow, on the blurred channel mean
+        # (blur: noise and Bayer aliasing), masked to in-view pixels, + first-order smoothness.
+        if train_opt.get('photo_opt'):
+            self.cri_photo = build_loss(train_opt['photo_opt']).to(self.device)
+            self.photo_sched = self._schedule(train_opt.get('photo_lambda', {}), 'photo_lambda')
+            self.photo_smooth = float(train_opt.get('photo_smooth', 0.1))
+            self.photo_sigma = float(train_opt.get('photo_sigma', 1.0))
+            self.photo_when = train_opt.get('photo_when', 'no_gt')
+            if self.photo_when not in ('no_gt', 'always'):
+                raise ValueError(f"train.photo_when must be 'no_gt' or 'always', got {self.photo_when!r}")
+
+        # Burst augmentation: random subset / order of the non-key frames (see augment_burst).
+        self.burst_aug = dict(train_opt['burst_aug']) if train_opt.get('burst_aug') else None
+
     def feed_data(self, data):
         self.lq = data['lq'].to(self.device) # [B, N, C, H, W]
         if 'gt' in data:
@@ -88,25 +144,71 @@ class MambaFusionModel(SRModel):
         # Only SyntheticBurstDataset in train mode ships it; the official val
         # set does not, so this is None on every validation pass.
         self.flow_gt = data['flow_vectors'].to(self.device) if 'flow_vectors' in data else None
+        # [B, N, 1, 2h, 2w], 0 where the generator's flow does not hold (SyntheticBurstDataset outliers)
+        self.flow_mask = data['flow_mask'].to(self.device) if 'flow_mask' in data else None
 
     def flow_lambda(self, current_iter):
         """lambda(t), linearly interpolated between the configured milestones
-        and held flat outside them."""
-        ms, vs = self.flow_milestones, self.flow_values
-        if current_iter <= ms[0]:
-            return float(vs[0])
-        if current_iter >= ms[-1]:
-            return float(vs[-1])
-        for i in range(1, len(ms)):
-            if current_iter <= ms[i]:
-                span = max(ms[i] - ms[i - 1], 1)
-                t = (current_iter - ms[i - 1]) / span
-                return float(vs[i - 1] + t * (vs[i] - vs[i - 1]))
-        return float(vs[-1])
+        and held flat outside them. current_iter is optimize_parameters' micro-step;
+        see _lambda for train.flow_lambda.unit."""
+        return self._lambda(self.flow_sched, current_iter)
 
-    def flow_loss(self, flows):
+    def ref_index(self, n):
+        """The keyframe slot the network reads for an n-frame burst (its ref_idx, else n // 2)."""
+        bare = self.get_bare_model(self.net_g)
+        ref = getattr(getattr(bare, 'align', None), 'ref_idx', None)
+        return (n // 2 if ref is None else ref) % n
+
+    def augment_burst(self, lq, flow_gt, flow_mask=None):
+        """train.burst_aug = {prob, min_frames, shuffle}. The burst is a set: with probability
+        prob keep the keyframe and a random subset of the other frames (size >= min_frames - 1),
+        and with shuffle permute the non-key frames' order on every batch. The keyframe is moved
+        to the slot the network reads (n // 2 of the new length). Trains robustness to burst
+        length (real bursts vary; frames get dropped) and to frame order (the scan is a
+        recurrence). The flow ground truth (and its mask) is indexed alongside."""
+        aug = self.burst_aug
+        B, N = lq.shape[:2]
+        ref = self.ref_index(N)
+        others = [i for i in range(N) if i != ref]
+        if aug.get('shuffle', True):
+            others = [others[i] for i in torch.randperm(len(others)).tolist()]
+        n = N
+        if N > 1 and torch.rand(()).item() < aug.get('prob', 0.0):
+            n = int(torch.randint(max(1, aug.get('min_frames', 2)), N + 1, ()).item())
+        others = others[:n - 1]
+        order = others[:self.ref_index(n)] + [ref] + others[self.ref_index(n):]
+        pick = lambda t: None if t is None else t[:, order]
+        return lq[:, order], pick(flow_gt), pick(flow_mask)
+
+    def photo_loss(self, flows, lq):
+        """See init_training_settings (photo_opt). flows['lv1']: (B, N, 2, h1, w1), that grid's px."""
+        from burstISP.archs.KGTSMamba.flow_align_arch import gaussian_blur
+        fl = flows['lv1'].float()
+        B, N = fl.shape[:2]
+        h, w = lq.shape[-2:]
+        if fl.shape[-2:] != (h, w):                        # Bayer grid: fold to packed like PostAlign
+            fl = F.avg_pool2d(fl.flatten(0, 1), kernel_size=2).view(B, N, 2, h, w) * 0.5
+        ref = self.ref_index(N)
+        lum = gaussian_blur(lq.float().mean(2).flatten(0, 1)[:, None], self.photo_sigma).view(B, N, 1, h, w)
+        ys, xs = torch.meshgrid(torch.arange(h, device=fl.device, dtype=fl.dtype),
+                                torch.arange(w, device=fl.device, dtype=fl.dtype), indexing='ij')
+        sx, sy = xs - fl[:, :, 0], ys - fl[:, :, 1]            # content of ref p sits at p - flow(p)
+        grid = torch.stack(((2 * sx + 1) / w - 1, (2 * sy + 1) / h - 1), -1).flatten(0, 1)
+        warped = F.grid_sample(lum.flatten(0, 1), grid, mode='bilinear', padding_mode='border',
+                               align_corners=False).view(B, N, 1, h, w)
+        inside = ((sx >= 0) & (sx <= w - 1) & (sy >= 0) & (sy <= h - 1)).float().unsqueeze(2)
+        keep = torch.arange(N, device=fl.device) != ref
+        target = lum[:, ref:ref + 1].expand_as(warped)
+        l_photo = self.cri_photo(warped[:, keep].flatten(0, 1), target[:, keep].flatten(0, 1),
+                                 weight=inside[:, keep].flatten(0, 1))
+        smooth = (fl[..., 1:, :] - fl[..., :-1, :]).abs().mean() + (fl[..., 1:] - fl[..., :-1]).abs().mean()
+        return l_photo + self.photo_smooth * smooth
+
+    def flow_loss(self, flows, gt=None, mask=None):
         """Charbonnier between each level's predicted flow and the generator's
-        flow, average-pooled to that level.
+        flow (gt, default self.flow_gt), average-pooled to that level. mask
+        [B, N, 1, 2h, 2w]: pixels where the ground truth does not hold (outliers)
+        are left out; a level's pixel counts only if all of its footprint is valid.
 
         The sign needs no negation here. `synthetic_burst_dataset.py:196` says
         the content the reference sees at p sits at `p - flow(p)` in frame i,
@@ -127,7 +229,7 @@ class MambaFusionModel(SRModel):
         96x96 to a level of side h scales magnitudes by h/96, which reproduces
         the x1 / x0.5 / x0.25 of `oracle_warp`'s pattern.
         """
-        gt = self.flow_gt
+        gt = self.flow_gt if gt is None else gt
         B, N = gt.shape[0], gt.shape[1]
         gt = gt.reshape(B * N, 2, gt.shape[-2], gt.shape[-1]).float()
         if self.flow_target == 'backward':
@@ -147,7 +249,11 @@ class MambaFusionModel(SRModel):
             # degrades gracefully if a crop size is not an exact power-of-two
             # multiple of the level size.
             target = F.adaptive_avg_pool2d(gt, (h, w)) * (h / gt_h)
-            l_flow = l_flow + self.cri_flow(pred, target)
+            weight = None
+            if mask is not None:
+                m = mask.reshape(B * N, 1, *mask.shape[-2:]).float()
+                weight = (F.adaptive_avg_pool2d(m, (h, w)) > 0.999).float()
+            l_flow = l_flow + self.cri_flow(pred, target, weight=weight)
 
         return l_flow / max(len(self.flow_levels), 1)
 
@@ -170,18 +276,25 @@ class MambaFusionModel(SRModel):
         
         # Forward Pass
         with sync_context():
+            lq, flow_gt, flow_mask = self.lq, self.flow_gt, getattr(self, 'flow_mask', None)
+            if self.burst_aug:
+                lq, flow_gt, flow_mask = self.augment_burst(lq, flow_gt, flow_mask)
             # lambda is read up front: when the curriculum has decayed to zero
             # there is nothing to gain from carrying the aux flows. The flow
             # head stays on the gradient path either way, through the DCN
             # offsets, so find_unused_parameters can stay false.
             lam = self.flow_lambda(current_iter) if self.cri_flow else 0.0
-            want_flow = self.cri_flow is not None and lam > 0 and self.flow_gt is not None
+            want_flow = self.cri_flow is not None and lam > 0 and flow_gt is not None
+            lam_photo = self._lambda(self.photo_sched, current_iter) if self.cri_photo else 0.0
+            want_photo = lam_photo > 0 and (flow_gt is None or self.photo_when == 'always')
+            # the aux head's loss is always taken (its weight may be 0): unused parameters break DDP
+            want_aux = self.cri_aux is not None
 
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                if want_flow:
-                    self.output, aux = self.net_g(self.lq, return_aux=True)
+                if want_flow or want_photo or want_aux:
+                    self.output, aux = self.net_g(lq, return_aux=True)
                 else:
-                    self.output, aux = self.net_g(self.lq), None
+                    self.output, aux = self.net_g(lq), None
 
             self.output = self.output.float()
             l_total = 0
@@ -209,10 +322,24 @@ class MambaFusionModel(SRModel):
 
             # Alignment flow loss (curriculum; lambda decays to zero)
             if want_flow:
-                l_flow = lam * self.flow_loss(aux['flows'])
+                l_flow = lam * self.flow_loss(aux['flows'], flow_gt, flow_mask)
                 l_total += l_flow
                 loss_dict['l_flow'] = l_flow
                 loss_dict['flow_lambda'] = torch.tensor(lam, device=self.device)
+
+            # Self-supervised photometric flow loss (bursts without flow ground truth)
+            if want_photo:
+                l_photo = lam_photo * self.photo_loss(aux['flows'], lq)
+                l_total += l_photo
+                loss_dict['l_photo'] = l_photo
+
+            # Burst-only auxiliary reconstruction (aux_head)
+            if want_aux:
+                pa = aux['burst'].float()
+                pa = self.compand(pa) if self.opt['train'].get('compand', True) else pa
+                l_aux = self._lambda(self.aux_sched, current_iter) * self.cri_aux(pa, cg)
+                l_total += l_aux
+                loss_dict['l_aux'] = l_aux
 
             # Backpropagation
             l_total = l_total / accumulation_steps

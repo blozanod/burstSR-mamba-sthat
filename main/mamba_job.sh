@@ -66,10 +66,22 @@ conda activate MambaTraining
 cd "$REPO/main"
 
 # KGTSMamba: ~1 min pre-flight on one GPU before committing all four --
-# CUDA scan vs reference (fwd + grads) and a training-step memory probe at
-# the config's batch. A failure here means silently wrong gradients or an
-# OOM, so do not train. See analysis/kgts_sanity.py.
+# the GMAC budget, then CUDA scan vs reference (fwd + grads) and a training-step
+# memory probe at the config's batch. A failure here means an over-budget model,
+# silently wrong gradients or an OOM, so do not train. See
+# burstISP/archs/KGTSMamba/budget_check.py and analysis/kgts_sanity.py.
+#
+# Budget: GMACs per burst at the benchmark input (1, 14, 4, 48, 48), counted like
+# the comparison tables (FlopCounter + analytic selective scans). 90 leaves room for
+# docs/KGTS_ADVERSARIAL_REVIEW.md's M1 (88.0; 78.1 before it).
+MAX_GMACS=90
 if grep -Eq '^[[:space:]]*type:[[:space:]]*KGTSMamba' "$CONFIG"; then
+    echo "  KGTSMamba budget (budget_check.py --budget $MAX_GMACS GMACs)"
+    if ! CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$REPO" python -m burstISP.archs.KGTSMamba.budget_check \
+            --config "$CONFIG" --budget "$MAX_GMACS"; then
+        echo "Over the $MAX_GMACS GMAC budget (or the count failed); not starting training."
+        exit 1
+    fi
     echo "  KGTSMamba pre-flight (analysis/kgts_sanity.py --skip overfit)"
     if ! CUDA_VISIBLE_DEVICES=0 python "$REPO/analysis/kgts_sanity.py" --config "$CONFIG" --skip overfit; then
         echo "Pre-flight FAILED; not starting training."

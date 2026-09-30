@@ -394,8 +394,9 @@ hard-codes the assumption. The first moving object is met at test time.
 1..max_frames non-key frames with that frame's own content displaced by 2–6 packed px (an
 independently moving object the keyframe does not show). The GT is untouched, and a
 `flow_mask` removes those pixels from the flow loss (`MambaFusionModel.flow_loss(mask=…)`;
-a level's pixel counts only if its whole footprint is valid). Off in M1 (the benchmark val
-set has no outliers); on for the synthetic run that pretrains a real-data model.
+a level's pixel counts only if its whole footprint is valid). On in M1 (30% of bursts): in
+the fusion probe it cost nothing on clean bursts and halved the damage of corrupted frames
+(§8).
 
 ### 6.2 The burst is a set of variable size (`train.burst_aug`)
 
@@ -478,9 +479,10 @@ on — both gains are at the noise floor, nothing to conclude yet):
 ## 9. Configs, budget, launch order
 
 `main/configs/M1_KGTSMamba.yml` carries every flag of this review (the queued M1 run
-starts with them). Only `datasets.train.outliers` is left off, on purpose: the benchmark
-val set has no outliers; turn it on for a run that pretrains a real-data model
-(`main/configs/M1_KGTSMamba_RealBSR.yml`).
+starts with them), including `datasets.train.outliers` (30% of bursts): in the fusion
+probe (§8) it cost nothing on clean bursts and halved the damage of corrupted frames, and
+it is the only thing in synthetic training that rewards rejecting a tap. The same run is
+then the starting point for `main/configs/M1_KGTSMamba_RealBSR.yml`.
 
 | at (1, 14, 4, 48, 48) | M1 at 236dbba | M1 now |
 |---|---|---|
@@ -514,7 +516,7 @@ smoke tests first), in order of expected information:
 4. `aux_head: false` (+ drop `train.aux_opt`) — watch how early the burst gain appears.
 5. `inject_first: false`, `depth_embed: false`, `untie_out: false`.
 
-Then the RealBSR fine-tune from a SyntheticBurst M1 trained with `outliers` on.
+Then the RealBSR fine-tune from the SyntheticBurst M1 (trained with `outliers` on).
 
 ---
 

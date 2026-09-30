@@ -31,6 +31,7 @@
 #   train.*.unit: iter        schedules in optimizer iterations (were micro-steps: the
 #                             flow curriculum ran 2x fast)
 #   train.burst_aug           random frame subsets / orders: the burst is a set
+#   datasets.train.outliers   moving-object outliers in 30% of bursts: something to reject
 #   train.ema_decay           weight EMA for validation / release
 #
 # Budget at (1, 14, 4, 48, 48), counted like budget_check.py on GPU (FlopCounter
@@ -73,12 +74,14 @@ datasets:
     num_worker_per_gpu: 6
     dataset_enlarge_ratio: 1
     grad_clip_norm: 1   # MambaFusionModel reads it here, not from train:
-    # Moving-object outliers: off for the benchmark run (SyntheticBurstVal has none,
-    # so they would only cost signal there). Turn on for a run that pretrains a
-    # real-data model (M1_KGTSMamba_RealBSR.yml): SyntheticBurst moves each frame by
-    # one affine map, so without them nothing ever rewards the consistency
-    # selectors for rejecting a tap.
-    # outliers: {prob: 0.3, max_frames: 3, size: 0.33, shift: [2, 6]}
+    # Moving-object outliers in 30% of bursts (1-3 non-key frames get a box of their own
+    # content displaced 2-6 packed px; the flow loss skips those pixels). SyntheticBurst
+    # moves each frame by one affine map, so without them nothing ever rewards the
+    # consistency selectors for rejecting a tap, and the first moving object is met at
+    # test time. Fusion probe (review §8): no cost on clean bursts (28.463 vs 28.470 dB
+    # base heads, 28.493 vs 28.491 roles), and the damage of 6 corrupted frames drops
+    # from -0.260 to -0.154 dB (base) / -0.123 to -0.067 (roles).
+    outliers: {prob: 0.3, max_frames: 3, size: 0.33, shift: [2, 6]}
 
   val:
     name: SyntheticBurst_val

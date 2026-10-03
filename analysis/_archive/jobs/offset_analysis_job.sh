@@ -23,7 +23,7 @@ fi
 conda activate MambaTraining
 cd /groups/rls/blozanod/MambaFusion
 
-torchrun --nproc_per_node=4 analysis/offset_analysis.py \
+torchrun --nproc_per_node=4 analysis/_archive/offset_analysis.py \
     --models_dir "$1" \
     --config main/config.yml \
     --data_root /groups/rls/blozanod/MambaFusion/dataset/RealBSR_RAW_testpatch \

@@ -36,8 +36,8 @@ Four stages, each printing PASS/FAIL (or numbers to eyeball):
                epe          lv1 flow end-point error vs the generator (packed px)
              then, on the same batch: PSNR with the real burst vs with every frame
              replaced by the keyframe ("all-ref"). A clear drop means KGTS output
-             matters. It is only a smoke signal -- the real burst test is
-             analysis/burst_ablation.py --dataset synburst on a trained checkpoint.
+             matters. It is only a smoke signal -- the real burst tests on a trained
+             checkpoint are analysis/diagnostics/ (error_bands, burst_length).
 """
 import argparse
 import math

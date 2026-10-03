@@ -6,7 +6,7 @@ import pickle as pkl
 
 # Setup paths to ensure the burstISP module can be imported
 current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.abspath(os.path.join(current_dir, '..'))
+parent_dir = os.path.abspath(os.path.join(current_dir, '..', '..'))
 sys.path.append(parent_dir)
 
 from burstISP.data.burst_image_dataset import BurstImageDataset

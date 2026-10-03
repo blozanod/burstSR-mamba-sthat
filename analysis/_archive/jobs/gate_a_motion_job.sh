@@ -23,7 +23,7 @@
 conda activate MambaTraining
 cd /groups/rls/blozanod/MambaFusion
 
-python analysis/gate_a_motion.py \
+python analysis/_archive/gate_a_motion.py \
     --config main/config.yml \
     --out-dir /groups/rls/blozanod/MambaFusion/analysis \
     "$@"

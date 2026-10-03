@@ -10,7 +10,7 @@ import numpy as np
 import pickle as pkl
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.abspath(os.path.join(current_dir, '..'))
+parent_dir = os.path.abspath(os.path.join(current_dir, '..', '..'))
 sys.path.append(parent_dir)
 
 from burstISP.archs.mambafusion_arch import MambaFusionNet

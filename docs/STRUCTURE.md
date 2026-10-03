@@ -60,26 +60,29 @@ burstSR-mamba-sthat/
 │   │   ├── R3D_RCAN3D_RAFT.yml       # 3D RCAN, RAFT-aligned, 78.6 GMACs
 │   │   └── R3D_RCAN3D_NoAlign.yml    # same, align: none (control)
 │   ├── jobs/                         # HPC submission scripts
+│   │   ├── diagnostics_job.sh        # KGTSMamba diagnostics on one checkpoint (1 GPU)
+│   │   ├── burst_ablation_job.sh     # burst_ablation.py (RealBSR, older)
 │   │   └── rcan3d_job.sh             # RCAN3D: gates -> train -> burst ablations
 │   └── _archive/Testing_Files/       # stale prototypes, superseded by train.py
 │
 ├── analysis/
+│   ├── diagnostics/                  # what a trained KGTSMamba gets right / wrong (README.md)
+│   │   ├── run_all.py                #   all four + SUMMARY.md (main/jobs/diagnostics_job.sh)
+│   │   ├── error_bands.py            #   error by frequency band / luma-chroma / edges; burst gain per band
+│   │   ├── colour_fit.py             #   per-image 3x3 + offset (and tone) colour fit
+│   │   ├── oracle_geometry.py        #   generator flow instead of LK; is the LK tail costing dB?
+│   │   ├── burst_length.py           #   true-length burst curve, N = 1..14, per band
+│   │   ├── common.py                 #   model / data / paired routing / metric / spectra
+│   │   └── smoke_test.py             #   CPU end-to-end check on fake data, tiny model
 │   ├── run_analysis.py               # orchestrator, called at end of training
 │   ├── analyze_logfile.py            # log parsing / dashboards
-│   ├── param_budget.py               # analytic parameter counter (no torch)
-│   ├── fusion_cost_model.py          # analytic FLOP + activation-memory model
-│   ├── count_macs.py                 # hook-measured conv/linear MACs for a config
-│   ├── burst_ablation.py             # two_pass (all-ref) + frame_drop curves
-│   ├── offset_analysis.py            # DCN offset magnitude across checkpoints
+│   ├── visualize_progress.py         # checkpoint previews (run_analysis stage 2)
 │   ├── kgts_sanity.py                # KGTSMamba GPU pre-flight (scan parity, memory, overfit)
 │   ├── kgts_cpu_checks.py            # KGTSMamba CPU checks (bit-exact flags-off, options, roles, LK)
-│   ├── fusion_attention_mass.py      # FusionBlock non-ref attention mass
-│   ├── gate_a_motion.py              # phase-correlation inter-frame motion
-│   ├── exposure_drift.py             # mean output intensity vs GT
-│   ├── dcn_probe.py, dcn_scatter_check.py
-│   ├── synburst_sanity.py, synburst_interp_baseline.py
-│   ├── shape_check.py, test_transform.py, burst_data.py
-│   ├── visualize_inference.py, visualize_progress.py, visualize_dataset.py
+│   ├── burst_ablation.py             # two_pass (all-ref) + frame_drop curves (rcan3d / older jobs)
+│   ├── count_macs.py                 # hook-measured conv/linear MACs for a config
+│   ├── shape_check.py                # one fwd/bwd at the config's batch, peak memory
+│   ├── _archive/                     # ST-HAT / DCN / RealBSR-era scripts (README.md lists them)
 │   └── outputs/                      # gitignored generated artifacts
 │
 ├── experiments/                      # one folder per run, created by train.py

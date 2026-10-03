@@ -45,7 +45,7 @@
 #     +0.416M alignment module. The alignment rewrite came in *under* L5
 #     instead (0.883M -> 0.631M), so the budget already closes at 5.032M and
 #     the cut would be an unforced 1.13M capacity loss. depths stay at
-#     [2,2,2,2]. Verify with `python analysis/param_budget.py <this file>`.
+#     [2,2,2,2]. Verify with `python analysis/_archive/param_budget.py <this file>`.
 #   - The second fusion pass (re-query) is not in this run. It costs +0.249M,
 #     which does not fit at 5.03M without taking fusion_depth_s1 to 2, and
 #     stage 1 is the contribution.

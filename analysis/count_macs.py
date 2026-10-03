@@ -6,7 +6,7 @@ Counts nn.Conv{1,2,3}d, nn.ConvTranspose{1,2,3}d and nn.Linear -- every
 multiply-accumulate in a pure conv net such as RCAN3D, so its number here is
 exact. It does NOT count attention matmuls, selective scans, grid_sample or
 DCN sampling, so for MambaFusionNet it is a lower bound; use
-analysis/fusion_cost_model.py there.
+analysis/_archive/fusion_cost_model.py there.
 
 Only registered submodules are hooked. RCAN3D's frozen RAFT aligner is
 deliberately not a registered submodule, so it runs (the forward needs its

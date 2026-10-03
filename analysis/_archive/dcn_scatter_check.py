@@ -50,7 +50,7 @@ import sys
 
 import torch
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from burstISP.archs.arch_util import DCNv4Block
 from burstISP.archs.dcn_align_arch import BurstAlign

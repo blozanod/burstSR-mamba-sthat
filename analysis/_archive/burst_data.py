@@ -34,7 +34,7 @@ import cv2
 import numpy as np
 import torch
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 DEFAULT_ROOTS = {
     'realbsr': '/groups/rls/blozanod/MambaFusion/dataset/RealBSR_RAW_testpatch',

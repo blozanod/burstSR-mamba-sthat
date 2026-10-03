@@ -62,7 +62,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # sibling: burst_data
 
 from burstISP.archs.mambafusion_arch import MambaFusionNet
@@ -204,7 +204,7 @@ def main():
     device     = torch.device(f'cuda:{local_rank}')
     torch.cuda.set_device(device)
 
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
     log_dir   = (args.log_dir if os.path.isabs(args.log_dir)
                  else os.path.join(repo_root, args.log_dir))
     os.makedirs(log_dir, exist_ok=True)

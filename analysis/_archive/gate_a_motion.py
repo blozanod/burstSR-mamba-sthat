@@ -39,7 +39,7 @@ from tqdm import tqdm
 from skimage.registration import phase_cross_correlation
 
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 DEFAULT_CONFIG = os.path.join(REPO_ROOT, 'main', 'config.yml')
 
 # Global flag set per-worker by pool initializer — avoids repeated arg passing

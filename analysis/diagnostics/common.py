@@ -129,8 +129,9 @@ def build_model(opt, ckpt, device, build_network, weights='ema'):
 
 
 def ref_slot(model, n):
-    """The slot the network reads the keyframe from in an n-frame burst (KGTSMamba.forward)."""
-    r = model.align.ref_idx
+    """The slot the network reads the keyframe from in an n-frame burst: align.ref_idx (KGTSMamba),
+    else n // 2 -- where SyntheticBurstDataset puts it."""
+    r = getattr(getattr(model, 'align', None), 'ref_idx', None)
     return (n // 2 if r is None else r) % n
 
 
@@ -190,8 +191,9 @@ class Runner:
 
     def __call__(self, lq, return_aux=False):
         self.routing.reset()
+        lq = lq.to(self.device, non_blocking=True)
         with torch.no_grad(), torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.amp):
-            out = self.model(lq.to(self.device, non_blocking=True), return_aux=return_aux)
+            out = self.model(lq, return_aux=True) if return_aux else self.model(lq)
         if return_aux:
             out, aux = out
             return out.float(), {k: (v.float() if torch.is_tensor(v) else v) for k, v in aux.items()}
@@ -261,7 +263,39 @@ class GeneratedBursts(torch.utils.data.Dataset):
                                                     interpolation_type='bilinear')
         return {'burst': burst.float(), 'gt': gt[:, bc:-bc, bc:-bc].float(), 'flow': flow.float(),
                 'name': f'{self.split}_{i:04d}_{os.path.basename(path)[:-4]}',
-                'shot': float(meta['shot_noise_level']), 'read': float(meta['read_noise_level'])}
+                'shot': float(meta['shot_noise_level']), 'read': float(meta['read_noise_level']),
+                'isp': isp_params(meta)}
+
+
+def isp_params(meta):
+    """The camera parameters render_srgb needs, from a DBSR meta_info dict (generator output or
+    SyntheticBurstVal's meta_info.pkl); {} if any is missing."""
+    keys = ('cam2rgb', 'rgb_gain', 'red_gain', 'blue_gain', 'gamma', 'smoothstep')
+    if not all(k in meta for k in keys):
+        return {}
+    return {'cam2rgb': torch.as_tensor(meta['cam2rgb']).float(),
+            **{k: float(meta[k]) for k in ('rgb_gain', 'red_gain', 'blue_gain')},
+            **{k: bool(meta[k]) for k in ('gamma', 'smoothstep')}}
+
+
+def render_srgb(lin, isp=None, exposure=None):
+    """Linear camera-space RGB (3, H, W) -> uint8 (H, W, 3) sRGB for viewing.
+
+    With the burst's camera parameters (isp_params) this is DBSR's process_linear_image_rgb --
+    gains, CCM, gamma, smoothstep: the image looks like the Zurich photo it came from. Without
+    them: a fixed exposure (pass the GT's, so every output of a burst shares it) and gamma 2.2."""
+    from burstISP.data.dbsr import camera_pipeline as cp
+    x = lin.detach().float().cpu().clamp(0, 1)
+    if isp:
+        x = cp.apply_gains(x, isp['rgb_gain'], isp['red_gain'], isp['blue_gain'])
+        x = cp.apply_ccm(x, isp['cam2rgb'])
+        if isp['gamma']:
+            x = cp.gamma_compression(x)
+        if isp['smoothstep']:
+            x = cp.apply_smoothstep(x)
+    else:
+        x = (x / (5 * (exposure if exposure else x.mean().item()) + 1e-8)).clamp(0, 1) ** (1 / 2.2)
+    return (x.clamp(0, 1) * 255 + 0.5).byte().permute(1, 2, 0).numpy()
 
 
 def loader(ds, args):

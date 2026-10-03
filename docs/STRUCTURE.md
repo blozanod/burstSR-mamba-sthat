@@ -61,6 +61,7 @@ burstSR-mamba-sthat/
 │   │   └── R3D_RCAN3D_NoAlign.yml    # same, align: none (control)
 │   ├── jobs/                         # HPC submission scripts
 │   │   ├── diagnostics_job.sh        # KGTSMamba diagnostics on one checkpoint (1 GPU)
+│   │   ├── analysis_job.sh           # run_analysis.py any time (dashboard + progress, 1 GPU)
 │   │   ├── burst_ablation_job.sh     # burst_ablation.py (RealBSR, older)
 │   │   └── rcan3d_job.sh             # RCAN3D: gates -> train -> burst ablations
 │   └── _archive/Testing_Files/       # stale prototypes, superseded by train.py
@@ -76,7 +77,8 @@ burstSR-mamba-sthat/
 │   │   └── smoke_test.py             #   CPU end-to-end check on fake data, tiny model
 │   ├── run_analysis.py               # orchestrator, called at end of training
 │   ├── analyze_logfile.py            # log parsing / dashboards
-│   ├── visualize_progress.py         # checkpoint previews (run_analysis stage 2)
+│   ├── visualize_progress.py         # same bursts through every checkpoint: strips + curves
+│   │                                 #   (--source synburst | zurich | realbsr; run_analysis stage 2)
 │   ├── kgts_sanity.py                # KGTSMamba GPU pre-flight (scan parity, memory, overfit)
 │   ├── kgts_cpu_checks.py            # KGTSMamba CPU checks (bit-exact flags-off, options, roles, LK)
 │   ├── burst_ablation.py             # two_pass (all-ref) + frame_drop curves (rcan3d / older jobs)

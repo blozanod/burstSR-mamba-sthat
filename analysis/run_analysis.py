@@ -8,7 +8,9 @@ Given a training config, this:
   2. Finds the most recent training log for that run.
   3. Runs the logfile analyzer -> dashboard PNG + markdown summary
      (all losses / all validation metrics, discovered dynamically).
-  4. Runs the checkpoint progress visualizer across every saved checkpoint.
+  4. Runs the checkpoint progress visualizer across every saved checkpoint
+     (visualize_progress.py --source auto: in-domain SyntheticBurstVal bursts for SyntheticBurst
+     configs, the RealBSR test bursts otherwise).
 
 All outputs land under analysis/outputs/<name>/, so nothing has to be run by
 hand after a training job finishes. Intended to be the single command
@@ -62,7 +64,7 @@ def run_log_analysis(exp_dir, name, out_dir, config_path):
     analyze_logfile.run(log_path, out_dir, config_path=config_path)
 
 
-def run_progress_visualization(exp_dir, out_dir, config_path, input_dir):
+def run_progress_visualization(exp_dir, out_dir, config_path, input_dir, source):
     checkpoints_dir = os.path.join(exp_dir, "models")
     if not os.path.isdir(checkpoints_dir) or not glob.glob(os.path.join(checkpoints_dir, "*.pth")):
         print(f"[run_analysis][WARN] No checkpoints found at {checkpoints_dir}; skipping progress viz.")
@@ -74,9 +76,9 @@ def run_progress_visualization(exp_dir, out_dir, config_path, input_dir):
         sys.executable, script,
         "--config", config_path,
         "--checkpoints_dir", checkpoints_dir,
-        "--input_dir", input_dir,
+        "--source", source,
         "--output_path", progress_out,
-    ]
+    ] + (["--input_dir", input_dir] if input_dir else [])
     print(f"[run_analysis] Running: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
 
@@ -94,8 +96,11 @@ def main():
                          help="Path to the training YAML config (default: main/config.yml)")
     parser.add_argument("--exp-root", default=os.path.join(REPO_ROOT, "experiments"),
                          help="Root folder containing experiment run directories")
-    parser.add_argument("--input-dir", default=os.path.join(REPO_ROOT, "dataset", "RealBSR_RAW_testpatch"),
-                         help="Dataset root used for progress-visualization inference")
+    parser.add_argument("--input-dir", default=None,
+                         help="Dataset root for progress visualization (default: per source -- the config's "
+                              "val root for synburst, dataset/RealBSR_RAW_testpatch for realbsr)")
+    parser.add_argument("--source", default="auto", choices=["auto", "synburst", "zurich", "realbsr"],
+                         help="Progress-visualization data (auto: from the config's val dataset type)")
     parser.add_argument("--skip-progress", action="store_true",
                          help="Skip the (slow, GPU-bound) checkpoint progress visualization")
     args = parser.parse_args()
@@ -135,7 +140,7 @@ def main():
         print("[run_analysis] Skipping progress visualization (--skip-progress).")
     else:
         try:
-            run_progress_visualization(exp_dir, out_dir, config_path, args.input_dir)
+            run_progress_visualization(exp_dir, out_dir, config_path, args.input_dir, args.source)
         except Exception:
             print("[run_analysis][ERROR] Progress visualization stage failed:")
             traceback.print_exc()

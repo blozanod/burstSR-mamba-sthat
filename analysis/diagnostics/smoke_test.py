@@ -11,7 +11,8 @@ is switched on (W_c perturbed), then:
      attenuation and white noise as additive; the colour fit recovers a known affine map; paired
      routing makes a burst's output independent of its batch; oracle_flow is in the convention the
      model's LK flow is in (and kgts_sanity's geometry stage passes on these bursts);
-  2. run_all.py --cpu on a few bursts, and checks every script wrote its outputs.
+  2. run_all.py --cpu on a few bursts, and checks every script wrote its outputs;
+  3. analysis/visualize_progress.py on both in-domain sources (synburst, zurich), two checkpoints.
 Numbers from the random model mean nothing; this only proves the code paths run.
 """
 import argparse
@@ -115,8 +116,13 @@ def make_ckpt(root, opt, build_network):
             torch.nn.init.normal_(p, std=0.05)
     d = os.path.join(root, 'experiments', opt['name'], 'models')
     os.makedirs(d, exist_ok=True)
-    sd = net.state_dict()
+    sd = {k: v.clone() for k, v in net.state_dict().items()}
     torch.save({'params': sd, 'params_ema': sd}, os.path.join(d, 'net_g_1000.pth'))
+    with torch.no_grad():                         # a second checkpoint for the progress strips
+        torch.nn.init.normal_(net.kgts.W_c.weight, std=0.4)
+    sd2 = net.state_dict()
+    torch.save({'params': sd2, 'params_ema': sd2}, os.path.join(d, 'net_g_2000.pth'))
+    net.load_state_dict(sd)
     return net.eval()
 
 
@@ -206,6 +212,20 @@ def main():
         have = [os.path.isfile(os.path.join(out, f'{s}{x}')) for x in ('.json', '.txt', '.png', '_per_image.csv')]
         check(f'{s} wrote json / txt / png / csv', all(have), str(have))
     check('SUMMARY.md written', os.path.isfile(os.path.join(out, 'SUMMARY.md')))
+
+    print('[progress] analysis/visualize_progress.py, in-domain sources')
+    for src in ('synburst', 'zurich'):
+        pout = os.path.join(root, f'progress_{src}')
+        cmd = [sys.executable, os.path.join(C.REPO, 'analysis', 'visualize_progress.py'), '--config', cfg,
+               '--checkpoints_dir', os.path.join(root, 'experiments', 'SMOKE_KGTS', 'models'), '--source', src,
+               '--output_path', pout, '--cpu', '--pool', '4', '--n_vis', '2', '--metric_bursts', '2']
+        rc = subprocess.run(cmd).returncode
+        strips = [f for f in os.listdir(pout) if f.endswith('_strip.png')] if os.path.isdir(pout) else []
+        fulls = [os.path.join(dp, f) for dp, _, fs in os.walk(pout) for f in fs if f in ('1000.png', '2000.png')]
+        check(f'visualize_progress --source {src}: exit 0, 2 strips, curves, full images per checkpoint',
+              rc == 0 and len(strips) == 2 and len(fulls) == 4
+              and all(os.path.isfile(os.path.join(pout, f)) for f in ('curves.csv', 'curves.png')),
+              f'exit {rc}, strips {len(strips)}, full images {len(fulls)}')
     print('ALL PASS' if OK[0] else 'SOME CHECKS FAILED')
     if not args.keep and not args.dir:
         shutil.rmtree(root, ignore_errors=True)
